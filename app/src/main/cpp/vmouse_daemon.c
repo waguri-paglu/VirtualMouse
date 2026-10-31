@@ -1,6 +1,6 @@
 /*
- * Virtual Mouse uinput Daemon for Rooted Android
- * Handles /dev/uinput virtual mouse registration and commands via stdin.
+ * Ultra-Low-Latency Virtual Mouse uinput Daemon for Rooted Android
+ * Uses batched single-syscall kernel writes and high-priority scheduling.
  */
 
 #include <stdio.h>
@@ -10,6 +10,8 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <signal.h>
+#include <sys/time.h>
+#include <sys/resource.h>
 #include <linux/input.h>
 #include <linux/uinput.h>
 #include <sys/ioctl.h>
@@ -23,20 +25,42 @@
 static int uinput_fd = -1;
 static volatile int keep_running = 1;
 
-void emit_event(int fd, int type, int code, int val) {
-    struct input_event ie;
-    memset(&ie, 0, sizeof(ie));
-    ie.type = type;
-    ie.code = code;
-    ie.value = val;
-    gettimeofday(&ie.time, NULL);
-    if (write(fd, &ie, sizeof(ie)) < 0) {
-        LOGE("Failed to write event: %s", strerror(errno));
-    }
+static inline void emit_single_With_syn(int fd, int type, int code, int val) {
+    struct input_event ev[2];
+    memset(ev, 0, sizeof(ev));
+    ev[0].type = type;
+    ev[0].code = code;
+    ev[0].value = val;
+    ev[1].type = EV_SYN;
+    ev[1].code = SYN_REPORT;
+    ev[1].value = 0;
+    write(fd, ev, sizeof(ev));
 }
 
-void syn(int fd) {
-    emit_event(fd, EV_SYN, SYN_REPORT, 0);
+static inline void emit_move_batched(int fd, int dx, int dy) {
+    struct input_event ev[3];
+    int count = 0;
+    memset(ev, 0, sizeof(ev));
+
+    if (dx != 0) {
+        ev[count].type = EV_REL;
+        ev[count].code = REL_X;
+        ev[count].value = dx;
+        count++;
+    }
+    if (dy != 0) {
+        ev[count].type = EV_REL;
+        ev[count].code = REL_Y;
+        ev[count].value = dy;
+        count++;
+    }
+    if (count > 0) {
+        ev[count].type = EV_SYN;
+        ev[count].code = SYN_REPORT;
+        ev[count].value = 0;
+        count++;
+        write(fd, ev, sizeof(struct input_event) * count);
+    }
 }
 
 void cleanup_device() {
@@ -49,7 +73,6 @@ void cleanup_device() {
 }
 
 void signal_handler(int sig) {
-    LOGI("Received signal %d, exiting", sig);
     keep_running = 0;
     cleanup_device();
     exit(0);
@@ -111,17 +134,14 @@ int init_uinput() {
 
     LOGI("Virtual mouse device successfully created in kernel!");
 
-    // Give Android InputReader 80ms to register the new input device, then emit a 1px nudge
-    // so Android's PointerController immediately shows the arrow cursor on screen!
-    usleep(80000);
-    emit_event(fd, EV_REL, REL_X, 1);
-    emit_event(fd, EV_REL, REL_Y, 1);
-    syn(fd);
+    // Wake up Android PointerController immediately
+    usleep(50000);
+    emit_move_batched(fd, 1, 1);
 
     return fd;
 }
 
-int map_button(int btn) {
+static inline int map_button(int btn) {
     switch (btn) {
         case 1: return BTN_LEFT;
         case 2: return BTN_RIGHT;
@@ -135,7 +155,11 @@ int main(int argc, char *argv[]) {
     signal(SIGTERM, signal_handler);
     signal(SIGHUP, signal_handler);
 
-    // Disable stdout buffering for immediate real-time IPC
+    // Elevate daemon scheduling priority to real-time urgent (-20 nice)
+    setpriority(PRIO_PROCESS, 0, -20);
+
+    // Disable buffering on stdin and stdout for zero-latency IPC
+    setvbuf(stdin, NULL, _IONBF, 0);
     setvbuf(stdout, NULL, _IONBF, 0);
 
     uinput_fd = init_uinput();
@@ -147,47 +171,51 @@ int main(int argc, char *argv[]) {
     printf("READY\n");
     fflush(stdout);
 
-    char line[256];
+    char line[128];
     while (keep_running && fgets(line, sizeof(line), stdin) != NULL) {
-        char cmd;
-        int arg1 = 0, arg2 = 0;
-        int parsed = sscanf(line, " %c %d %d", &cmd, &arg1, &arg2);
+        char cmd = line[0];
+        if (cmd == '\0' || cmd == '\n') continue;
 
-        if (parsed <= 0) continue;
+        int arg1 = 0, arg2 = 0;
 
         switch (cmd) {
             case 'M': // Move: M <dx> <dy>
-                emit_event(uinput_fd, EV_REL, REL_X, arg1);
-                emit_event(uinput_fd, EV_REL, REL_Y, arg2);
-                syn(uinput_fd);
+                if (sscanf(line + 1, "%d %d", &arg1, &arg2) == 2) {
+                    emit_move_batched(uinput_fd, arg1, arg2);
+                }
                 break;
 
             case 'D': // Button Down: D <btn>
-                emit_event(uinput_fd, EV_KEY, map_button(arg1), 1);
-                syn(uinput_fd);
+                if (sscanf(line + 1, "%d", &arg1) == 1) {
+                    emit_single_With_syn(uinput_fd, EV_KEY, map_button(arg1), 1);
+                }
                 break;
 
             case 'U': // Button Up: U <btn>
-                emit_event(uinput_fd, EV_KEY, map_button(arg1), 0);
-                syn(uinput_fd);
+                if (sscanf(line + 1, "%d", &arg1) == 1) {
+                    emit_single_With_syn(uinput_fd, EV_KEY, map_button(arg1), 0);
+                }
                 break;
 
             case 'C': // Click: C <btn>
-                emit_event(uinput_fd, EV_KEY, map_button(arg1), 1);
-                syn(uinput_fd);
-                usleep(15000); // 15ms click duration
-                emit_event(uinput_fd, EV_KEY, map_button(arg1), 0);
-                syn(uinput_fd);
+                if (sscanf(line + 1, "%d", &arg1) == 1) {
+                    int code = map_button(arg1);
+                    emit_single_With_syn(uinput_fd, EV_KEY, code, 1);
+                    usleep(4000); // 4ms fast click pulse
+                    emit_single_With_syn(uinput_fd, EV_KEY, code, 0);
+                }
                 break;
 
             case 'W': // Vertical Scroll Wheel: W <val>
-                emit_event(uinput_fd, EV_REL, REL_WHEEL, arg1);
-                syn(uinput_fd);
+                if (sscanf(line + 1, "%d", &arg1) == 1 && arg1 != 0) {
+                    emit_single_With_syn(uinput_fd, EV_REL, REL_WHEEL, arg1);
+                }
                 break;
 
             case 'H': // Horizontal Scroll Wheel: H <val>
-                emit_event(uinput_fd, EV_REL, REL_HWHEEL, arg1);
-                syn(uinput_fd);
+                if (sscanf(line + 1, "%d", &arg1) == 1 && arg1 != 0) {
+                    emit_single_With_syn(uinput_fd, EV_REL, REL_HWHEEL, arg1);
+                }
                 break;
 
             case 'Q': // Quit
