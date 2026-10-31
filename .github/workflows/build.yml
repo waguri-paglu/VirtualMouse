@@ -27,38 +27,39 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3
 
-      - name: Install NDK & CMake
+      - name: Accept Android SDK Licenses
         run: |
-          echo "y" | sdkmanager "ndk;25.1.8937393" "cmake;3.22.1"
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
 
-      - name: Ensure Gradle Wrapper Executable & Setup
+      - name: Ensure Gradle Wrapper Executable
         run: |
           if [ ! -f gradle/wrapper/gradle-wrapper.jar ]; then
-            echo "Generating Gradle wrapper..."
+            echo "Gradle wrapper JAR not found; generating via system gradle..."
             gradle wrapper --gradle-version 8.4 || true
           fi
-          chmod +x gradlew
+          chmod +x gradlew || true
 
       - name: Build Release APK
-        run: ./gradlew assembleRelease --stacktrace
+        run: ./gradlew assembleRelease --stacktrace || gradle assembleRelease --stacktrace
 
       - name: Locate Built APK
         id: apk
         run: |
-          APK_FILE=$(find app/build/outputs/apk/release -name "*.apk" | head -n 1)
+          APK_FILE=$(find app/build/outputs/apk -name "*.apk" | head -n 1)
+          if [ -z "$APK_FILE" ]; then
+            echo "ERROR: No APK found!"
+            exit 1
+          fi
           echo "Found APK: $APK_FILE"
           echo "apk_path=$APK_FILE" >> $GITHUB_OUTPUT
 
       - name: Upload Build Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: VirtualMouse-Release-APK
+          name: VirtualMouse-APK
           path: ${{ steps.apk.outputs.apk_path }}
 
       - name: Determine Release Tag
