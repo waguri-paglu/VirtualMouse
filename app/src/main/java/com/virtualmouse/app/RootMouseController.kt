@@ -6,23 +6,32 @@ import android.os.SystemClock
 import android.util.Log
 import java.io.File
 import java.io.FileOutputStream
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.InetAddress
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.util.concurrent.Executors
 import java.util.zip.ZipFile
 
 /**
- * Manages the root uinput direct digitizer daemon and dispatches exact
- * normalized (0..32767) cursor coordinates via 2-microsecond JNI UDP packets.
+ * Manages the root uinput + EVIOCGRAB kernel daemon and syncs screen config,
+ * floating dock button coordinates, and Trackpad/Touch grab states.
  */
 object RootMouseController {
     private const val TAG = "RootMouseController"
     private const val TARGET_DAEMON_PATH = "/data/local/tmp/vmouse_daemon"
 
-    private const val CMD_DRAG_MOVE = 1
-    private const val CMD_TOUCH_DOWN = 2
-    private const val CMD_TOUCH_UP = 3
-    private const val CMD_LEFT_CLICK = 4
-    private const val CMD_RIGHT_CLICK = 5
+    private const val CMD_MOVE = 1
+    private const val CMD_DOWN = 2
+    private const val CMD_UP = 3
+    private const val CMD_CLICK = 4
+    private const val CMD_SCROLL_V = 5
+    private const val CMD_SCROLL_H = 6
     private const val CMD_PING = 7
+    private const val CMD_SET_GRAB = 8
+    private const val CMD_SET_CONFIG = 9
+    private const val CMD_SET_DOCK = 10
     private const val CMD_QUIT = 99
 
     init {
@@ -34,7 +43,7 @@ object RootMouseController {
     }
 
     @JvmStatic
-    external fun nativeSendPacket(cmd: Int, arg1: Int, arg2: Int): Boolean
+    external fun nativeSendPacket(cmd: Int, arg1: Int, arg2: Int, arg3: Int, arg4: Int): Boolean
 
     enum class DriverState {
         IDLE,
@@ -47,9 +56,11 @@ object RootMouseController {
 
     @Volatile private var isRunning = false
     @Volatile private var isStarting = false
+    @Volatile private var callbackSocket: DatagramSocket? = null
     private val executor = Executors.newCachedThreadPool()
 
     var onStateChanged: ((DriverState, String) -> Unit)? = null
+    var onGrabModeChangedFromDaemon: ((Boolean) -> Unit)? = null
 
     fun isRootAvailable(): Boolean {
         return try {
@@ -65,7 +76,7 @@ object RootMouseController {
     fun isAttached(): Boolean = isRunning
 
     fun startAsync(context: Context, onResult: (Boolean, String?) -> Unit) {
-        if (isRunning && nativeSendPacket(CMD_PING, 0, 0)) {
+        if (isRunning && nativeSendPacket(CMD_PING, 0, 0, 0, 0)) {
             notifyState(DriverState.RUNNING, "Virtual mouse active")
             onResult(true, null)
             return
@@ -93,7 +104,7 @@ object RootMouseController {
                     return@execute
                 }
 
-                notifyState(DriverState.CONNECTING, "Registering hardware pointer device...")
+                notifyState(DriverState.CONNECTING, "Registering hardware pointer & EVIOCGRAB...")
 
                 val launchCmd = "killall -9 vmouse_daemon 2>/dev/null || true; " +
                         "chmod 755 $TARGET_DAEMON_PATH; " +
@@ -108,7 +119,7 @@ object RootMouseController {
                 var connected = false
                 val startTime = SystemClock.uptimeMillis()
                 while (SystemClock.uptimeMillis() - startTime < 3500L) {
-                    if (nativeSendPacket(CMD_PING, 0, 0)) {
+                    if (nativeSendPacket(CMD_PING, 0, 0, 0, 0)) {
                         connected = true
                         break
                     }
@@ -118,6 +129,7 @@ object RootMouseController {
                 if (connected) {
                     isRunning = true
                     isStarting = false
+                    startCallbackListener()
                     notifyState(DriverState.RUNNING, "Virtual mouse active")
                     onResult(true, null)
                 } else {
@@ -136,6 +148,28 @@ object RootMouseController {
         }
     }
 
+    private fun startCallbackListener() {
+        try {
+            callbackSocket?.close()
+        } catch (ignored: Exception) {}
+
+        executor.execute {
+            try {
+                val sock = DatagramSocket(29877, InetAddress.getByName("127.0.0.1"))
+                callbackSocket = sock
+                val buf = ByteArray(4)
+                val pkt = DatagramPacket(buf, buf.size)
+                while (isRunning && !sock.isClosed) {
+                    sock.receive(pkt)
+                    if (pkt.length == 4) {
+                        val grabbed = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN).int == 1
+                        onGrabModeChangedFromDaemon?.invoke(grabbed)
+                    }
+                }
+            } catch (ignored: Exception) {}
+        }
+    }
+
     private fun notifyState(state: DriverState, message: String) {
         onStateChanged?.invoke(state, message)
     }
@@ -145,8 +179,14 @@ object RootMouseController {
         isStarting = false
         isRunning = false
         try {
-            nativeSendPacket(CMD_QUIT, 0, 0)
+            nativeSendPacket(CMD_SET_GRAB, 0, 0, 0, 0)
+            nativeSendPacket(CMD_QUIT, 0, 0, 0, 0)
         } catch (ignored: Throwable) {}
+
+        try {
+            callbackSocket?.close()
+            callbackSocket = null
+        } catch (ignored: Exception) {}
 
         executor.execute {
             try {
@@ -158,34 +198,37 @@ object RootMouseController {
         Log.i(TAG, "Root virtual mouse daemon stopped.")
     }
 
-    private fun toNorm(coord: Float, maxDim: Int): Int {
-        if (maxDim <= 0) return 0
-        return ((coord / maxDim.toFloat()) * 32767f).toInt().coerceIn(0, 32767)
+    fun setTouchGrab(enable: Boolean) {
+        if (!isRunning) return
+        nativeSendPacket(CMD_SET_GRAB, if (enable) 1 else 0, 0, 0, 0)
     }
 
-    fun leftClickAt(x: Float, y: Float, screenW: Int, screenH: Int) {
+    fun updateConfig(sens: Float, scrollSens: Float, screenW: Int, screenH: Int, rotation: Int) {
         if (!isRunning) return
-        nativeSendPacket(CMD_LEFT_CLICK, toNorm(x, screenW), toNorm(y, screenH))
+        val s1 = (sens * 100f).toInt()
+        val s2 = (scrollSens * 100f).toInt()
+        val packedHAndRot = (screenH and 0xFFFF) or ((rotation and 0x3) shl 16)
+        nativeSendPacket(CMD_SET_CONFIG, s1, s2, screenW, packedHAndRot)
     }
 
-    fun rightClickAt(x: Float, y: Float, screenW: Int, screenH: Int) {
+    fun updateDockBounds(left: Int, top: Int, right: Int, bottom: Int) {
         if (!isRunning) return
-        nativeSendPacket(CMD_RIGHT_CLICK, toNorm(x, screenW), toNorm(y, screenH))
+        nativeSendPacket(CMD_SET_DOCK, left, top, right, bottom)
     }
 
-    fun touchDownAt(x: Float, y: Float, screenW: Int, screenH: Int) {
+    fun click(button: Int = 1) {
         if (!isRunning) return
-        nativeSendPacket(CMD_TOUCH_DOWN, toNorm(x, screenW), toNorm(y, screenH))
+        nativeSendPacket(CMD_CLICK, button, 0, 0, 0)
     }
 
-    fun dragMoveAt(x: Float, y: Float, screenW: Int, screenH: Int) {
+    fun mouseDown(button: Int = 1) {
         if (!isRunning) return
-        nativeSendPacket(CMD_DRAG_MOVE, toNorm(x, screenW), toNorm(y, screenH))
+        nativeSendPacket(CMD_DOWN, button, 0, 0, 0)
     }
 
-    fun touchUpAt() {
+    fun mouseUp(button: Int = 1) {
         if (!isRunning) return
-        nativeSendPacket(CMD_TOUCH_UP, 0, 0)
+        nativeSendPacket(CMD_UP, button, 0, 0, 0)
     }
 
     private fun deployDaemonBinary(context: Context): String? {
