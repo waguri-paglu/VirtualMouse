@@ -9,9 +9,12 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
+import android.graphics.Color
 import android.graphics.PixelFormat
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.view.Gravity
 import android.view.HapticFeedbackConstants
 import android.view.LayoutInflater
@@ -36,8 +39,9 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
     private lateinit var trackpadLayoutParams: WindowManager.LayoutParams
     private lateinit var controlsLayoutParams: WindowManager.LayoutParams
 
+    private val mainHandler = Handler(Looper.getMainLooper())
     private var isTrackpadActive = true
-    private var sensitivity: Float = 1.3f
+    private var sensitivity: Float = 1.4f
     private var scrollSensitivity: Float = 0.5f
 
     companion object {
@@ -53,16 +57,18 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
 
         prefs = PreferenceManager.getDefaultSharedPreferences(this)
-        sensitivity = prefs.getFloat("sensitivity", 1.3f)
+        sensitivity = prefs.getFloat("sensitivity", 1.4f)
         scrollSensitivity = prefs.getFloat("scroll_sensitivity", 0.5f)
         prefs.registerOnSharedPreferenceChangeListener(this)
 
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, createNotification())
 
-        RootMouseController.startAsync(this) { success, _ ->
-            if (!success) {
-                stopSelf()
+        if (!RootMouseController.isAttached()) {
+            RootMouseController.startAsync(this) { success, _ ->
+                if (!success) {
+                    stopSelf()
+                }
             }
         }
 
@@ -74,7 +80,7 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
         if (sharedPreferences == null) return
         when (key) {
             "sensitivity" -> {
-                sensitivity = sharedPreferences.getFloat("sensitivity", 1.3f)
+                sensitivity = sharedPreferences.getFloat("sensitivity", 1.4f)
                 trackpadOverlayView?.sensitivity = sensitivity
             }
             "scroll_sensitivity" -> {
@@ -88,7 +94,10 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
         trackpadOverlayView = GestureTrackpadView(this).apply {
             this.sensitivity = this@OverlayService.sensitivity
             this.scrollSensitivity = this@OverlayService.scrollSensitivity
-            setBackgroundColor(0x01000000)
+            setBackgroundColor(Color.TRANSPARENT)
+            onPerformClickPassthrough = { button ->
+                performPassthroughClick(button)
+            }
         }
 
         val layoutType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -103,15 +112,58 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
             WindowManager.LayoutParams.MATCH_PARENT,
             layoutType,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
                     WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
-                    WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
-            PixelFormat.TRANSLUCENT
+                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSPARENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
         }
 
         windowManager.addView(trackpadOverlayView, trackpadLayoutParams)
+    }
+
+    /**
+     * Temporarily makes the full-screen trackpad overlay non-touchable for a split second
+     * while emitting the hardware uinput click so the click hits the underlying app at the cursor!
+     */
+    private fun performPassthroughClick(button: Int) {
+        if (!isTrackpadActive || trackpadOverlayView == null) {
+            RootMouseController.click(button)
+            return
+        }
+
+        mainHandler.removeCallbacks(restoreTouchableRunnable)
+        setOverlayTouchable(false)
+
+        mainHandler.postDelayed({
+            RootMouseController.click(button)
+            mainHandler.postDelayed(restoreTouchableRunnable, 45L)
+        }, 20L)
+    }
+
+    private val restoreTouchableRunnable = Runnable {
+        if (isTrackpadActive) {
+            setOverlayTouchable(true)
+        }
+    }
+
+    private fun setOverlayTouchable(touchable: Boolean) {
+        val view = trackpadOverlayView ?: return
+        try {
+            if (touchable) {
+                trackpadLayoutParams.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                        WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                        WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                        WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+            } else {
+                trackpadLayoutParams.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                        WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                        WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                        WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+            }
+            windowManager.updateViewLayout(view, trackpadLayoutParams)
+        } catch (ignored: Exception) {}
     }
 
     @SuppressLint("ClickableViewAccessibility", "InflateParams")
@@ -131,8 +183,7 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
             WindowManager.LayoutParams.WRAP_CONTENT,
             layoutType,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                    WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
@@ -145,26 +196,19 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
         val tvStatus = controlsView?.findViewById<TextView>(R.id.tv_mode_status)
         val dragHandle = controlsView?.findViewById<View>(R.id.drag_handle)
 
-        btnLeftClick?.setOnTouchListener { v, event ->
-            when (event.action) {
-                MotionEvent.ACTION_DOWN -> {
-                    v.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
-                    RootMouseController.mouseDown(1)
-                    true
-                }
-                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                    RootMouseController.mouseUp(1)
-                    true
-                }
-                else -> false
-            }
+        // Left Click button: passes click through to underlying app
+        btnLeftClick?.setOnClickListener { v ->
+            v.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+            performPassthroughClick(1)
         }
 
+        // Right Click button: passes right-click through to underlying app
         btnRightClick?.setOnClickListener { v ->
             v.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
-            RootMouseController.click(2)
+            performPassthroughClick(2)
         }
 
+        // Toggle Trackpad vs Passthrough touch mode
         btnToggle?.setOnClickListener { v ->
             v.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
             toggleTrackpadMode(tvStatus)
@@ -203,24 +247,16 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
         isTrackpadActive = !isTrackpadActive
 
         if (isTrackpadActive) {
-            trackpadLayoutParams.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
-                    WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED
+            setOverlayTouchable(true)
             statusTextView?.text = "TRACKPAD"
             statusTextView?.setTextColor(0xFF10B981.toInt())
             trackpadOverlayView?.visibility = View.VISIBLE
         } else {
-            trackpadLayoutParams.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+            setOverlayTouchable(false)
             statusTextView?.text = "TOUCH"
             statusTextView?.setTextColor(0xFF38BDF8.toInt())
             trackpadOverlayView?.visibility = View.GONE
         }
-
-        windowManager.updateViewLayout(trackpadOverlayView, trackpadLayoutParams)
     }
 
     private fun createNotificationChannel() {
@@ -272,6 +308,7 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
 
     override fun onDestroy() {
         super.onDestroy()
+        mainHandler.removeCallbacksAndMessages(null)
         prefs.unregisterOnSharedPreferenceChangeListener(this)
         trackpadOverlayView?.let { windowManager.removeView(it) }
         controlsView?.let { windowManager.removeView(it) }

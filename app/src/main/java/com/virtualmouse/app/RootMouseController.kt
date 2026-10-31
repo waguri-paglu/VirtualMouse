@@ -2,26 +2,16 @@ package com.virtualmouse.app
 
 import android.content.Context
 import android.os.Build
-import android.os.Process as AndroidProcess
 import android.os.SystemClock
 import android.util.Log
-import java.io.BufferedReader
-import java.io.BufferedWriter
 import java.io.File
 import java.io.FileOutputStream
-import java.io.InputStreamReader
-import java.io.OutputStreamWriter
-import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.Executors
-import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicInteger
-import java.util.concurrent.locks.LockSupport
 import java.util.zip.ZipFile
 
 /**
- * Ultra-low-latency controller for the native uinput daemon.
- * Coalesces high-frequency touch deltas atomically so the UI thread never blocks
- * and the IPC pipe never builds up a laggy event queue.
+ * Manages the root uinput daemon lifecycle and dispatches all movement/click
+ * events via direct C JNI binary datagrams (@vmouse_fast_sock) with zero pipe latency.
  */
 object RootMouseController {
     private const val TAG = "RootMouseController"
@@ -36,21 +26,8 @@ object RootMouseController {
         ERROR
     }
 
-    private var process: Process? = null
-    private var writer: BufferedWriter? = null
-    private var reader: BufferedReader? = null
     @Volatile private var isRunning = false
     @Volatile private var isStarting = false
-
-    // Atomic accumulators for lock-free event coalescing
-    private val pendingDx = AtomicInteger(0)
-    private val pendingDy = AtomicInteger(0)
-    private val pendingScrollY = AtomicInteger(0)
-    private val pendingScrollX = AtomicInteger(0)
-    private val discreteCommandQueue = ConcurrentLinkedQueue<String>()
-    private val hasPendingWork = AtomicBoolean(false)
-
-    @Volatile private var dispatcherThread: Thread? = null
     private val executor = Executors.newCachedThreadPool()
 
     var onStateChanged: ((DriverState, String) -> Unit)? = null
@@ -69,7 +46,7 @@ object RootMouseController {
     fun isAttached(): Boolean = isRunning
 
     fun startAsync(context: Context, onResult: (Boolean, String?) -> Unit) {
-        if (isRunning && writer != null) {
+        if (isRunning && NativeBridge.nativeSendPacket(NativeBridge.CMD_PING, 0, 0)) {
             notifyState(DriverState.RUNNING, "Virtual mouse active")
             onResult(true, null)
             return
@@ -99,61 +76,42 @@ object RootMouseController {
 
                 notifyState(DriverState.CONNECTING, "Registering hardware pointer device...")
 
+                // Launch daemon detached in background via su so su stdin pipe is never used for IPC
+                val launchCmd = "killall -9 vmouse_daemon 2>/dev/null || true; " +
+                        "chmod 755 $TARGET_DAEMON_PATH; " +
+                        "chmod 666 /dev/uinput /dev/input/uinput 2>/dev/null || true; " +
+                        "nohup $TARGET_DAEMON_PATH >/dev/null 2>&1 &
+exit
+"
+
                 val suProcess = Runtime.getRuntime().exec("su")
-                // Small 512-byte buffer for low-overhead flushing
-                val out = BufferedWriter(OutputStreamWriter(suProcess.outputStream), 512)
-                val inStream = suProcess.inputStream
-                val inReader = BufferedReader(InputStreamReader(inStream), 256)
+                suProcess.outputStream.write(launchCmd.toByteArray())
+                suProcess.outputStream.flush()
+                suProcess.waitFor()
 
-                out.write("killall -9 vmouse_daemon 2>/dev/null || true\n")
-                out.write("chmod 755 $TARGET_DAEMON_PATH\n")
-                out.write("chmod 666 /dev/uinput 2>/dev/null || true\n")
-                out.write("chmod 666 /dev/input/uinput 2>/dev/null || true\n")
-                out.write("exec $TARGET_DAEMON_PATH\n")
-                out.flush()
-
-                var line: String? = null
+                // Poll the fast abstract socket via JNI until the daemon binds it (typically < 100ms)
+                var connected = false
                 val startTime = SystemClock.uptimeMillis()
-                while (SystemClock.uptimeMillis() - startTime < 4000L) {
-                    if (inStream.available() > 0) {
-                        line = inReader.readLine()
-                        if (line != null) break
+                while (SystemClock.uptimeMillis() - startTime < 3500L) {
+                    if (NativeBridge.nativeSendPacket(NativeBridge.CMD_PING, 0, 0)) {
+                        connected = true
+                        break
                     }
                     Thread.sleep(25)
                 }
 
-                Log.i(TAG, "Daemon response: $line")
-
-                val startedOk = if (line != null && line.contains("READY")) {
-                    true
-                } else if (line != null && line.contains("ERROR")) {
-                    false
-                } else {
-                    // Check if process is alive
-                    try {
-                        suProcess.exitValue()
-                        false
-                    } catch (e: IllegalThreadStateException) {
-                        true
-                    }
-                }
-
-                if (startedOk) {
-                    process = suProcess
-                    writer = out
-                    reader = inReader
+                if (connected) {
                     isRunning = true
                     isStarting = false
-                    startDispatcherThread()
-                    move(2, 2)
+                    // Send initial cursor nudge
+                    NativeBridge.nativeSendPacket(NativeBridge.CMD_MOVE, 2, 2)
                     notifyState(DriverState.RUNNING, "Virtual mouse active")
                     onResult(true, null)
                 } else {
                     isStarting = false
-                    val errMsg = line ?: "Daemon exited prematurely during uinput registration."
+                    val errMsg = "Daemon socket did not respond within timeout."
                     notifyState(DriverState.ERROR, errMsg)
                     onResult(false, errMsg)
-                    suProcess.destroy()
                 }
             } catch (e: Exception) {
                 isStarting = false
@@ -165,81 +123,6 @@ object RootMouseController {
         }
     }
 
-    /**
-     * Dedicated high-priority thread that drains coalesced movement deltas
-     * and discrete button events without blocking Android's UI thread.
-     */
-    private fun startDispatcherThread() {
-        dispatcherThread?.interrupt()
-        pendingDx.set(0)
-        pendingDy.set(0)
-        pendingScrollY.set(0)
-        pendingScrollX.set(0)
-        discreteCommandQueue.clear()
-
-        val thread = Thread({
-            AndroidProcess.setThreadPriority(AndroidProcess.THREAD_PRIORITY_URGENT_DISPLAY)
-            val sb = StringBuilder(64)
-
-            while (isRunning && !Thread.currentThread().isInterrupted) {
-                if (!hasPendingWork.compareAndSet(true, false)) {
-                    LockSupport.parkNanos(50_000_000L) // Park up to 50ms until unparked
-                    continue
-                }
-
-                val out = writer ?: break
-                var wroteAnything = false
-                sb.setLength(0)
-
-                // 1. Coalesce all accumulated movement deltas into a single kernel frame
-                val dx = pendingDx.getAndSet(0)
-                val dy = pendingDy.getAndSet(0)
-                if (dx != 0 || dy != 0) {
-                    sb.append("M ").append(dx).append(' ').append(dy).append('\n')
-                    wroteAnything = true
-                }
-
-                // 2. Coalesce vertical & horizontal scroll deltas
-                val sy = pendingScrollY.getAndSet(0)
-                if (sy != 0) {
-                    sb.append("W ").append(sy).append('\n')
-                    wroteAnything = true
-                }
-                val sx = pendingScrollX.getAndSet(0)
-                if (sx != 0) {
-                    sb.append("H ").append(sx).append('\n')
-                    wroteAnything = true
-                }
-
-                // 3. Drain discrete button clicks/presses in exact order
-                while (true) {
-                    val cmd = discreteCommandQueue.poll() ?: break
-                    sb.append(cmd).append('\n')
-                    wroteAnything = true
-                }
-
-                if (wroteAnything) {
-                    try {
-                        out.write(sb.toString())
-                        out.flush()
-                    } catch (e: Exception) {
-                        Log.e(TAG, "Dispatcher write failed", e)
-                        break
-                    }
-                }
-            }
-        }, "VMouse-Dispatcher")
-
-        thread.isDaemon = true
-        dispatcherThread = thread
-        thread.start()
-    }
-
-    private fun wakeDispatcher() {
-        hasPendingWork.set(true)
-        dispatcherThread?.let { LockSupport.unpark(it) }
-    }
-
     private fun notifyState(state: DriverState, message: String) {
         onStateChanged?.invoke(state, message)
     }
@@ -248,19 +131,9 @@ object RootMouseController {
     fun stop() {
         isStarting = false
         isRunning = false
-        dispatcherThread?.interrupt()
-        dispatcherThread = null
-
         try {
-            writer?.write("Q\n")
-            writer?.flush()
-        } catch (ignored: Exception) {}
-
-        try {
-            writer?.close()
-            reader?.close()
-            process?.destroy()
-        } catch (ignored: Exception) {}
+            NativeBridge.nativeSendPacket(NativeBridge.CMD_QUIT, 0, 0)
+        } catch (ignored: Throwable) {}
 
         executor.execute {
             try {
@@ -268,51 +141,41 @@ object RootMouseController {
             } catch (ignored: Exception) {}
         }
 
-        process = null
-        writer = null
-        reader = null
         notifyState(DriverState.IDLE, "Virtual mouse stopped")
         Log.i(TAG, "Root virtual mouse daemon stopped.")
     }
 
     /**
-     * Lock-free, non-blocking movement accumulation called from the UI thread.
+     * Direct 2-microsecond JNI datagram call (zero blocking, zero buffering).
      */
     fun move(dx: Int, dy: Int) {
         if (!isRunning || (dx == 0 && dy == 0)) return
-        pendingDx.addAndGet(dx)
-        pendingDy.addAndGet(dy)
-        wakeDispatcher()
+        NativeBridge.nativeSendPacket(NativeBridge.CMD_MOVE, dx, dy)
     }
 
     fun mouseDown(button: Int = 1) {
         if (!isRunning) return
-        discreteCommandQueue.offer("D $button")
-        wakeDispatcher()
+        NativeBridge.nativeSendPacket(NativeBridge.CMD_DOWN, button, 0)
     }
 
     fun mouseUp(button: Int = 1) {
         if (!isRunning) return
-        discreteCommandQueue.offer("U $button")
-        wakeDispatcher()
+        NativeBridge.nativeSendPacket(NativeBridge.CMD_UP, button, 0)
     }
 
     fun click(button: Int = 1) {
         if (!isRunning) return
-        discreteCommandQueue.offer("C $button")
-        wakeDispatcher()
+        NativeBridge.nativeSendPacket(NativeBridge.CMD_CLICK, button, 0)
     }
 
     fun scroll(dy: Int) {
         if (!isRunning || dy == 0) return
-        pendingScrollY.addAndGet(dy)
-        wakeDispatcher()
+        NativeBridge.nativeSendPacket(NativeBridge.CMD_SCROLL_V, dy, 0)
     }
 
     fun scrollHorizontal(dx: Int) {
         if (!isRunning || dx == 0) return
-        pendingScrollX.addAndGet(dx)
-        wakeDispatcher()
+        NativeBridge.nativeSendPacket(NativeBridge.CMD_SCROLL_H, dx, 0)
     }
 
     private fun deployDaemonBinary(context: Context): String? {
@@ -320,8 +183,7 @@ object RootMouseController {
             val libDir = File(context.applicationInfo.nativeLibraryDir)
             val candidates = listOf(
                 File(libDir, "libvmouse_bin.so"),
-                File(libDir, "vmouse_daemon"),
-                File(libDir, "libvmouse.so")
+                File(libDir, "vmouse_daemon")
             )
 
             var sourceFile: File? = candidates.firstOrNull { it.exists() && it.length() > 0 }
@@ -333,7 +195,6 @@ object RootMouseController {
                     ZipFile(apkFile).use { zip ->
                         for (abi in abiList) {
                             val entry = zip.getEntry("lib/$abi/libvmouse_bin.so")
-                                ?: zip.getEntry("lib/$abi/libvmouse.so")
                                 ?: zip.getEntry("lib/$abi/vmouse_daemon")
                             if (entry != null) {
                                 val tempFile = File(context.cacheDir, "vmouse_bin_$abi")
