@@ -1,9 +1,7 @@
 /*
- * Unified Ultra-Low-Latency Virtual Mouse C Engine (Daemon + JNI Bridge)
- * - When loaded as libvmouse.so via JNI: provides Java_com_virtualmouse_app_RootMouseController_nativeSendPacket
- *   which sends 12-byte binary packets over 127.0.0.1:29876 (UDP loopback) with MSG_DONTWAIT in ~2 microseconds.
- * - When executed as root daemon (libvmouse_bin.so): opens /dev/uinput, binds 127.0.0.1:29876,
- *   coalesces packet bursts in C, and writes batched input_event frames in a single syscall.
+ * Unified Real-Time Virtual Mouse Engine (Direct EV_ABS Digitizer + JNI Bridge)
+ * Eliminates Android TouchInputMapper cursor hiding/teleporting by pairing a
+ * 120Hz hardware-accelerated overlay arrow with a direct 0..32767 EV_ABS uinput device.
  */
 
 #include <stdio.h>
@@ -39,19 +37,19 @@
 
 #define FAST_UDP_PORT 29876
 
-#define CMD_MOVE     1
-#define CMD_DOWN     2
-#define CMD_UP       3
-#define CMD_CLICK    4
-#define CMD_SCROLL_V 5
-#define CMD_SCROLL_H 6
-#define CMD_PING     7
-#define CMD_QUIT     99
+#define CMD_DRAG_MOVE 1
+#define CMD_TOUCH_DOWN 2
+#define CMD_TOUCH_UP   3
+#define CMD_LEFT_CLICK 4
+#define CMD_RIGHT_CLICK 5
+#define CMD_SCROLL_STEP 6
+#define CMD_PING       7
+#define CMD_QUIT       99
 
 struct vmouse_packet {
     int32_t cmd;
-    int32_t arg1;
-    int32_t arg2;
+    int32_t arg1; // absX (0..32767) or scroll delta
+    int32_t arg2; // absY (0..32767)
 };
 
 /* ============================================================================
@@ -106,7 +104,7 @@ Java_com_virtualmouse_app_RootMouseController_nativeSendPacket(
     if (cmd == CMD_PING && sent == sizeof(pkt)) {
         struct timeval tv;
         tv.tv_sec = 0;
-        tv.tv_usec = 40000; // 40ms timeout for PONG
+        tv.tv_usec = 40000;
         setsockopt(client_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         int32_t pong = 0;
         ssize_t r = recv(client_sock, &pong, sizeof(pong), 0);
@@ -117,52 +115,105 @@ Java_com_virtualmouse_app_RootMouseController_nativeSendPacket(
 }
 
 /* ============================================================================
- * PART 2: Root Kernel /dev/uinput Daemon
+ * PART 2: Root Kernel /dev/uinput Direct Digitizer Daemon
  * ============================================================================ */
 static int uinput_fd = -1;
 static int sock_fd = -1;
 static volatile int keep_running = 1;
 
-static inline void emit_single_with_syn(int fd, int type, int code, int val) {
-    struct input_event ev[2];
-    memset(ev, 0, sizeof(ev));
-    ev[0].type = type;
-    ev[0].code = code;
-    ev[0].value = val;
-    ev[1].type = EV_SYN;
-    ev[1].code = SYN_REPORT;
-    ev[1].value = 0;
-    if (write(fd, ev, sizeof(ev)) < 0) {
-        // Ignore transient write errors
-    }
+static inline int clamp_abs(int val) {
+    if (val < 0) return 0;
+    if (val > 32767) return 32767;
+    return val;
 }
 
-static inline void emit_move_batched(int fd, int dx, int dy) {
-    if (dx == 0 && dy == 0) return;
-    struct input_event ev[3];
+static void emit_abs_down(int fd, int abs_x, int abs_y, int is_right) {
+    struct input_event ev[6];
     int count = 0;
     memset(ev, 0, sizeof(ev));
 
-    if (dx != 0) {
-        ev[count].type = EV_REL;
-        ev[count].code = REL_X;
-        ev[count].value = dx;
+    ev[count].type = EV_ABS;
+    ev[count].code = ABS_X;
+    ev[count].value = clamp_abs(abs_x);
+    count++;
+
+    ev[count].type = EV_ABS;
+    ev[count].code = ABS_Y;
+    ev[count].value = clamp_abs(abs_y);
+    count++;
+
+    ev[count].type = EV_KEY;
+    ev[count].code = BTN_TOUCH;
+    ev[count].value = 1;
+    count++;
+
+    if (is_right) {
+        ev[count].type = EV_KEY;
+        ev[count].code = BTN_STYLUS2;
+        ev[count].value = 1;
+        count++;
+
+        ev[count].type = EV_KEY;
+        ev[count].code = BTN_RIGHT;
+        ev[count].value = 1;
         count++;
     }
-    if (dy != 0) {
-        ev[count].type = EV_REL;
-        ev[count].code = REL_Y;
-        ev[count].value = dy;
-        count++;
-    }
+
     ev[count].type = EV_SYN;
     ev[count].code = SYN_REPORT;
     ev[count].value = 0;
     count++;
 
-    if (write(fd, ev, sizeof(struct input_event) * count) < 0) {
-        // Ignore transient write errors
+    if (write(fd, ev, sizeof(struct input_event) * count) < 0) {}
+}
+
+static void emit_abs_move(int fd, int abs_x, int abs_y) {
+    struct input_event ev[3];
+    memset(ev, 0, sizeof(ev));
+
+    ev[0].type = EV_ABS;
+    ev[0].code = ABS_X;
+    ev[0].value = clamp_abs(abs_x);
+
+    ev[1].type = EV_ABS;
+    ev[1].code = ABS_Y;
+    ev[1].value = clamp_abs(abs_y);
+
+    ev[2].type = EV_SYN;
+    ev[2].code = SYN_REPORT;
+    ev[2].value = 0;
+
+    if (write(fd, ev, sizeof(ev)) < 0) {}
+}
+
+static void emit_abs_up(int fd, int is_right) {
+    struct input_event ev[4];
+    int count = 0;
+    memset(ev, 0, sizeof(ev));
+
+    ev[count].type = EV_KEY;
+    ev[count].code = BTN_TOUCH;
+    ev[count].value = 0;
+    count++;
+
+    if (is_right) {
+        ev[count].type = EV_KEY;
+        ev[count].code = BTN_STYLUS2;
+        ev[count].value = 0;
+        count++;
+
+        ev[count].type = EV_KEY;
+        ev[count].code = BTN_RIGHT;
+        ev[count].value = 0;
+        count++;
     }
+
+    ev[count].type = EV_SYN;
+    ev[count].code = SYN_REPORT;
+    ev[count].value = 0;
+    count++;
+
+    if (write(fd, ev, sizeof(struct input_event) * count) < 0) {}
 }
 
 void cleanup_device(void) {
@@ -195,28 +246,36 @@ int init_uinput(void) {
         return -1;
     }
 
-    ioctl(fd, UI_SET_EVBIT, EV_REL);
-    ioctl(fd, UI_SET_RELBIT, REL_X);
-    ioctl(fd, UI_SET_RELBIT, REL_Y);
-    ioctl(fd, UI_SET_RELBIT, REL_WHEEL);
-    ioctl(fd, UI_SET_RELBIT, REL_HWHEEL);
+    // Direct screen digitizer property: maps 0..32767 directly to screen pixels
+    // and prevents Android PointerController from spawning a second freezing/teleporting cursor!
+    ioctl(fd, UI_SET_PROPBIT, INPUT_PROP_DIRECT);
 
     ioctl(fd, UI_SET_EVBIT, EV_KEY);
+    ioctl(fd, UI_SET_KEYBIT, BTN_TOUCH);
+    ioctl(fd, UI_SET_KEYBIT, BTN_TOOL_PEN);
+    ioctl(fd, UI_SET_KEYBIT, BTN_STYLUS);
+    ioctl(fd, UI_SET_KEYBIT, BTN_STYLUS2);
     ioctl(fd, UI_SET_KEYBIT, BTN_LEFT);
     ioctl(fd, UI_SET_KEYBIT, BTN_RIGHT);
-    ioctl(fd, UI_SET_KEYBIT, BTN_MIDDLE);
-    ioctl(fd, UI_SET_KEYBIT, BTN_SIDE);
-    ioctl(fd, UI_SET_KEYBIT, BTN_EXTRA);
+
+    ioctl(fd, UI_SET_EVBIT, EV_ABS);
+    ioctl(fd, UI_SET_ABSBIT, ABS_X);
+    ioctl(fd, UI_SET_ABSBIT, ABS_Y);
 
     ioctl(fd, UI_SET_EVBIT, EV_SYN);
 
     struct uinput_user_dev uidev;
     memset(&uidev, 0, sizeof(uidev));
-    snprintf(uidev.name, UINPUT_MAX_NAME_SIZE, "Virtual Mobile Trackpad Mouse");
-    uidev.id.bustype = BUS_USB;
-    uidev.id.vendor = 0x1234;
-    uidev.id.product = 0x5678;
+    snprintf(uidev.name, UINPUT_MAX_NAME_SIZE, "Virtual Mouse Direct Digitizer");
+    uidev.id.bustype = BUS_VIRTUAL;
+    uidev.id.vendor = 0x18d1;
+    uidev.id.product = 0x4ee7;
     uidev.id.version = 1;
+
+    uidev.absmin[ABS_X] = 0;
+    uidev.absmax[ABS_X] = 32767;
+    uidev.absmin[ABS_Y] = 0;
+    uidev.absmax[ABS_Y] = 32767;
 
     if (write(fd, &uidev, sizeof(uidev)) < 0) {
         LOGE("Failed to write uinput_user_dev: %s", strerror(errno));
@@ -230,11 +289,7 @@ int init_uinput(void) {
         return -1;
     }
 
-    LOGI("Virtual mouse device successfully created in kernel!");
-
-    usleep(40000);
-    emit_move_batched(fd, 1, 1);
-
+    LOGI("Virtual direct digitizer device created in kernel!");
     return fd;
 }
 
@@ -267,44 +322,37 @@ int init_fast_socket(void) {
     return fd;
 }
 
-static inline int map_button(int btn) {
-    switch (btn) {
-        case 1: return BTN_LEFT;
-        case 2: return BTN_RIGHT;
-        case 3: return BTN_MIDDLE;
-        default: return BTN_LEFT;
-    }
-}
-
-static void execute_non_move_packet(
+static void handle_packet(
     const struct vmouse_packet *pkt,
     const struct sockaddr_in *client_addr,
     socklen_t client_len
 ) {
     switch (pkt->cmd) {
-        case CMD_DOWN:
-            emit_single_with_syn(uinput_fd, EV_KEY, map_button(pkt->arg1), 1);
+        case CMD_DRAG_MOVE:
+            emit_abs_move(uinput_fd, pkt->arg1, pkt->arg2);
             break;
-        case CMD_UP:
-            emit_single_with_syn(uinput_fd, EV_KEY, map_button(pkt->arg1), 0);
+
+        case CMD_TOUCH_DOWN:
+            emit_abs_down(uinput_fd, pkt->arg1, pkt->arg2, 0);
             break;
-        case CMD_CLICK: {
-            int code = map_button(pkt->arg1);
-            emit_single_with_syn(uinput_fd, EV_KEY, code, 1);
-            usleep(6000);
-            emit_single_with_syn(uinput_fd, EV_KEY, code, 0);
+
+        case CMD_TOUCH_UP:
+            emit_abs_up(uinput_fd, 0);
             break;
-        }
-        case CMD_SCROLL_V:
-            if (pkt->arg1 != 0) {
-                emit_single_with_syn(uinput_fd, EV_REL, REL_WHEEL, pkt->arg1);
-            }
+
+        case CMD_LEFT_CLICK:
+            emit_abs_down(uinput_fd, pkt->arg1, pkt->arg2, 0);
+            usleep(14000);
+            emit_abs_up(uinput_fd, 0);
             break;
-        case CMD_SCROLL_H:
-            if (pkt->arg1 != 0) {
-                emit_single_with_syn(uinput_fd, EV_REL, REL_HWHEEL, pkt->arg1);
-            }
+
+        case CMD_RIGHT_CLICK:
+            // Trigger context menu at exact cursor coordinates via long-press / stylus secondary
+            emit_abs_down(uinput_fd, pkt->arg1, pkt->arg2, 1);
+            usleep(520000); // 520ms native Android context-menu hold at cursor position
+            emit_abs_up(uinput_fd, 1);
             break;
+
         case CMD_PING:
             if (client_addr != NULL && client_len > 0) {
                 int32_t pong = 1;
@@ -312,9 +360,11 @@ static void execute_non_move_packet(
                        (const struct sockaddr *)client_addr, client_len);
             }
             break;
+
         case CMD_QUIT:
             keep_running = 0;
             break;
+
         default:
             break;
     }
@@ -349,7 +399,6 @@ int main(int argc, char *argv[]) {
     fflush(stdout);
 
     struct vmouse_packet pkt;
-    struct vmouse_packet next_pkt;
     struct sockaddr_in client_addr;
     socklen_t client_len = sizeof(client_addr);
 
@@ -361,41 +410,7 @@ int main(int argc, char *argv[]) {
             if (n < 0 && (errno == EINTR || errno == EAGAIN)) continue;
             break;
         }
-
-        int32_t accum_dx = 0;
-        int32_t accum_dy = 0;
-
-        if (pkt.cmd == CMD_MOVE) {
-            accum_dx += pkt.arg1;
-            accum_dy += pkt.arg2;
-        } else {
-            execute_non_move_packet(&pkt, &client_addr, client_len);
-        }
-
-        // Drain all queued packets in the socket buffer immediately
-        while (keep_running) {
-            client_len = sizeof(client_addr);
-            ssize_t m = recvfrom(sock_fd, &next_pkt, sizeof(next_pkt), MSG_DONTWAIT,
-                                 (struct sockaddr *)&client_addr, &client_len);
-            if (m != sizeof(next_pkt)) {
-                break;
-            }
-            if (next_pkt.cmd == CMD_MOVE) {
-                accum_dx += next_pkt.arg1;
-                accum_dy += next_pkt.arg2;
-            } else {
-                if (accum_dx != 0 || accum_dy != 0) {
-                    emit_move_batched(uinput_fd, accum_dx, accum_dy);
-                    accum_dx = 0;
-                    accum_dy = 0;
-                }
-                execute_non_move_packet(&next_pkt, &client_addr, client_len);
-            }
-        }
-
-        if (accum_dx != 0 || accum_dy != 0) {
-            emit_move_batched(uinput_fd, accum_dx, accum_dy);
-        }
+        handle_packet(&pkt, &client_addr, client_len);
     }
 
     cleanup_device();

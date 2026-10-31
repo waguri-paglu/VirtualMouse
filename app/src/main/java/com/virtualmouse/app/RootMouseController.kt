@@ -10,19 +10,18 @@ import java.util.concurrent.Executors
 import java.util.zip.ZipFile
 
 /**
- * Manages the root uinput daemon lifecycle and dispatches all movement/click
- * events via direct C JNI binary UDP datagrams (127.0.0.1:29876) with zero pipe latency.
+ * Manages the root uinput direct digitizer daemon and dispatches exact
+ * normalized (0..32767) cursor coordinates via 2-microsecond JNI UDP packets.
  */
 object RootMouseController {
     private const val TAG = "RootMouseController"
     private const val TARGET_DAEMON_PATH = "/data/local/tmp/vmouse_daemon"
 
-    private const val CMD_MOVE = 1
-    private const val CMD_DOWN = 2
-    private const val CMD_UP = 3
-    private const val CMD_CLICK = 4
-    private const val CMD_SCROLL_V = 5
-    private const val CMD_SCROLL_H = 6
+    private const val CMD_DRAG_MOVE = 1
+    private const val CMD_TOUCH_DOWN = 2
+    private const val CMD_TOUCH_UP = 3
+    private const val CMD_LEFT_CLICK = 4
+    private const val CMD_RIGHT_CLICK = 5
     private const val CMD_PING = 7
     private const val CMD_QUIT = 99
 
@@ -119,7 +118,6 @@ object RootMouseController {
                 if (connected) {
                     isRunning = true
                     isStarting = false
-                    nativeSendPacket(CMD_MOVE, 2, 2)
                     notifyState(DriverState.RUNNING, "Virtual mouse active")
                     onResult(true, null)
                 } else {
@@ -160,34 +158,34 @@ object RootMouseController {
         Log.i(TAG, "Root virtual mouse daemon stopped.")
     }
 
-    fun move(dx: Int, dy: Int) {
-        if (!isRunning || (dx == 0 && dy == 0)) return
-        nativeSendPacket(CMD_MOVE, dx, dy)
+    private fun toNorm(coord: Float, maxDim: Int): Int {
+        if (maxDim <= 0) return 0
+        return ((coord / maxDim.toFloat()) * 32767f).toInt().coerceIn(0, 32767)
     }
 
-    fun mouseDown(button: Int = 1) {
+    fun leftClickAt(x: Float, y: Float, screenW: Int, screenH: Int) {
         if (!isRunning) return
-        nativeSendPacket(CMD_DOWN, button, 0)
+        nativeSendPacket(CMD_LEFT_CLICK, toNorm(x, screenW), toNorm(y, screenH))
     }
 
-    fun mouseUp(button: Int = 1) {
+    fun rightClickAt(x: Float, y: Float, screenW: Int, screenH: Int) {
         if (!isRunning) return
-        nativeSendPacket(CMD_UP, button, 0)
+        nativeSendPacket(CMD_RIGHT_CLICK, toNorm(x, screenW), toNorm(y, screenH))
     }
 
-    fun click(button: Int = 1) {
+    fun touchDownAt(x: Float, y: Float, screenW: Int, screenH: Int) {
         if (!isRunning) return
-        nativeSendPacket(CMD_CLICK, button, 0)
+        nativeSendPacket(CMD_TOUCH_DOWN, toNorm(x, screenW), toNorm(y, screenH))
     }
 
-    fun scroll(dy: Int) {
-        if (!isRunning || dy == 0) return
-        nativeSendPacket(CMD_SCROLL_V, dy, 0)
+    fun dragMoveAt(x: Float, y: Float, screenW: Int, screenH: Int) {
+        if (!isRunning) return
+        nativeSendPacket(CMD_DRAG_MOVE, toNorm(x, screenW), toNorm(y, screenH))
     }
 
-    fun scrollHorizontal(dx: Int) {
-        if (!isRunning || dx == 0) return
-        nativeSendPacket(CMD_SCROLL_H, dx, 0)
+    fun touchUpAt() {
+        if (!isRunning) return
+        nativeSendPacket(CMD_TOUCH_UP, 0, 0)
     }
 
     private fun deployDaemonBinary(context: Context): String? {
