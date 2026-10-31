@@ -102,21 +102,27 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
     }
 
     private fun updateScreenMetrics() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            val bounds = windowManager.maximumWindowMetrics.bounds
-            screenWidth = bounds.width()
-            screenHeight = bounds.height()
-            screenRotation = display?.rotation ?: Surface.ROTATION_0
-        } else {
-            val dm = DisplayMetrics()
-            @Suppress("DEPRECATION")
-            val disp = windowManager.defaultDisplay
-            @Suppress("DEPRECATION")
-            disp.getRealMetrics(dm)
+        try {
+            val displayManager = getSystemService(Context.DISPLAY_SERVICE) as android.hardware.display.DisplayManager
+            val defaultDisplay = displayManager.getDisplay(android.view.Display.DEFAULT_DISPLAY)
+            screenRotation = defaultDisplay?.rotation ?: Surface.ROTATION_0
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                val bounds = windowManager.maximumWindowMetrics.bounds
+                screenWidth = bounds.width()
+                screenHeight = bounds.height()
+            } else if (defaultDisplay != null) {
+                val dm = DisplayMetrics()
+                @Suppress("DEPRECATION")
+                defaultDisplay.getRealMetrics(dm)
+                screenWidth = dm.widthPixels
+                screenHeight = dm.heightPixels
+            }
+        } catch (e: Exception) {
+            val dm = resources.displayMetrics
             screenWidth = dm.widthPixels
             screenHeight = dm.heightPixels
-            @Suppress("DEPRECATION")
-            screenRotation = disp.rotation
+            screenRotation = Surface.ROTATION_0
         }
     }
 
