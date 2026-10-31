@@ -11,11 +11,31 @@ import java.util.zip.ZipFile
 
 /**
  * Manages the root uinput daemon lifecycle and dispatches all movement/click
- * events via direct C JNI binary datagrams (@vmouse_fast_sock) with zero pipe latency.
+ * events via direct C JNI binary UDP datagrams (127.0.0.1:29876) with zero pipe latency.
  */
 object RootMouseController {
     private const val TAG = "RootMouseController"
     private const val TARGET_DAEMON_PATH = "/data/local/tmp/vmouse_daemon"
+
+    private const val CMD_MOVE = 1
+    private const val CMD_DOWN = 2
+    private const val CMD_UP = 3
+    private const val CMD_CLICK = 4
+    private const val CMD_SCROLL_V = 5
+    private const val CMD_SCROLL_H = 6
+    private const val CMD_PING = 7
+    private const val CMD_QUIT = 99
+
+    init {
+        try {
+            System.loadLibrary("vmouse")
+        } catch (e: Throwable) {
+            Log.e(TAG, "Failed to load libvmouse.so", e)
+        }
+    }
+
+    @JvmStatic
+    external fun nativeSendPacket(cmd: Int, arg1: Int, arg2: Int): Boolean
 
     enum class DriverState {
         IDLE,
@@ -46,7 +66,7 @@ object RootMouseController {
     fun isAttached(): Boolean = isRunning
 
     fun startAsync(context: Context, onResult: (Boolean, String?) -> Unit) {
-        if (isRunning && NativeBridge.nativeSendPacket(NativeBridge.CMD_PING, 0, 0)) {
+        if (isRunning && nativeSendPacket(CMD_PING, 0, 0)) {
             notifyState(DriverState.RUNNING, "Virtual mouse active")
             onResult(true, null)
             return
@@ -76,24 +96,20 @@ object RootMouseController {
 
                 notifyState(DriverState.CONNECTING, "Registering hardware pointer device...")
 
-                // Launch daemon detached in background via su so su stdin pipe is never used for IPC
                 val launchCmd = "killall -9 vmouse_daemon 2>/dev/null || true; " +
                         "chmod 755 $TARGET_DAEMON_PATH; " +
                         "chmod 666 /dev/uinput /dev/input/uinput 2>/dev/null || true; " +
-                        "nohup $TARGET_DAEMON_PATH >/dev/null 2>&1 &
-exit
-"
+                        "nohup $TARGET_DAEMON_PATH >/dev/null 2>&1 &\nexit\n"
 
                 val suProcess = Runtime.getRuntime().exec("su")
                 suProcess.outputStream.write(launchCmd.toByteArray())
                 suProcess.outputStream.flush()
                 suProcess.waitFor()
 
-                // Poll the fast abstract socket via JNI until the daemon binds it (typically < 100ms)
                 var connected = false
                 val startTime = SystemClock.uptimeMillis()
                 while (SystemClock.uptimeMillis() - startTime < 3500L) {
-                    if (NativeBridge.nativeSendPacket(NativeBridge.CMD_PING, 0, 0)) {
+                    if (nativeSendPacket(CMD_PING, 0, 0)) {
                         connected = true
                         break
                     }
@@ -103,8 +119,7 @@ exit
                 if (connected) {
                     isRunning = true
                     isStarting = false
-                    // Send initial cursor nudge
-                    NativeBridge.nativeSendPacket(NativeBridge.CMD_MOVE, 2, 2)
+                    nativeSendPacket(CMD_MOVE, 2, 2)
                     notifyState(DriverState.RUNNING, "Virtual mouse active")
                     onResult(true, null)
                 } else {
@@ -132,7 +147,7 @@ exit
         isStarting = false
         isRunning = false
         try {
-            NativeBridge.nativeSendPacket(NativeBridge.CMD_QUIT, 0, 0)
+            nativeSendPacket(CMD_QUIT, 0, 0)
         } catch (ignored: Throwable) {}
 
         executor.execute {
@@ -145,37 +160,34 @@ exit
         Log.i(TAG, "Root virtual mouse daemon stopped.")
     }
 
-    /**
-     * Direct 2-microsecond JNI datagram call (zero blocking, zero buffering).
-     */
     fun move(dx: Int, dy: Int) {
         if (!isRunning || (dx == 0 && dy == 0)) return
-        NativeBridge.nativeSendPacket(NativeBridge.CMD_MOVE, dx, dy)
+        nativeSendPacket(CMD_MOVE, dx, dy)
     }
 
     fun mouseDown(button: Int = 1) {
         if (!isRunning) return
-        NativeBridge.nativeSendPacket(NativeBridge.CMD_DOWN, button, 0)
+        nativeSendPacket(CMD_DOWN, button, 0)
     }
 
     fun mouseUp(button: Int = 1) {
         if (!isRunning) return
-        NativeBridge.nativeSendPacket(NativeBridge.CMD_UP, button, 0)
+        nativeSendPacket(CMD_UP, button, 0)
     }
 
     fun click(button: Int = 1) {
         if (!isRunning) return
-        NativeBridge.nativeSendPacket(NativeBridge.CMD_CLICK, button, 0)
+        nativeSendPacket(CMD_CLICK, button, 0)
     }
 
     fun scroll(dy: Int) {
         if (!isRunning || dy == 0) return
-        NativeBridge.nativeSendPacket(NativeBridge.CMD_SCROLL_V, dy, 0)
+        nativeSendPacket(CMD_SCROLL_V, dy, 0)
     }
 
     fun scrollHorizontal(dx: Int) {
         if (!isRunning || dx == 0) return
-        NativeBridge.nativeSendPacket(NativeBridge.CMD_SCROLL_H, dx, 0)
+        nativeSendPacket(CMD_SCROLL_H, dx, 0)
     }
 
     private fun deployDaemonBinary(context: Context): String? {

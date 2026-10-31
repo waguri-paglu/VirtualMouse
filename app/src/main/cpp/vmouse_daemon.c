@@ -1,7 +1,9 @@
 /*
- * Ultra-Low-Latency Virtual Mouse uinput Daemon for Rooted Android
- * Listens on 127.0.0.1:29876 (UDP loopback) for 12-byte binary packets from JNI,
- * coalesces bursts in C, and writes batched input_event frames directly to /dev/uinput.
+ * Unified Ultra-Low-Latency Virtual Mouse C Engine (Daemon + JNI Bridge)
+ * - When loaded as libvmouse.so via JNI: provides Java_com_virtualmouse_app_RootMouseController_nativeSendPacket
+ *   which sends 12-byte binary packets over 127.0.0.1:29876 (UDP loopback) with MSG_DONTWAIT in ~2 microseconds.
+ * - When executed as root daemon (libvmouse_bin.so): opens /dev/uinput, binds 127.0.0.1:29876,
+ *   coalesces packet bursts in C, and writes batched input_event frames in a single syscall.
  */
 
 #include <stdio.h>
@@ -14,6 +16,7 @@
 #include <errno.h>
 #include <signal.h>
 #include <sched.h>
+#include <jni.h>
 #include <sys/time.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
@@ -51,6 +54,71 @@ struct vmouse_packet {
     int32_t arg2;
 };
 
+/* ============================================================================
+ * PART 1: JNI Client Fast-Path (Used in-process by Android App)
+ * ============================================================================ */
+static int client_sock = -1;
+static struct sockaddr_in daemon_addr;
+
+static void ensure_client_socket(void) {
+    if (client_sock >= 0) return;
+
+    client_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (client_sock < 0) return;
+
+    int sndbuf = 262144;
+    setsockopt(client_sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+
+    memset(&daemon_addr, 0, sizeof(daemon_addr));
+    daemon_addr.sin_family = AF_INET;
+    daemon_addr.sin_port = htons(FAST_UDP_PORT);
+    daemon_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_virtualmouse_app_RootMouseController_nativeSendPacket(
+    JNIEnv *env,
+    jclass clazz,
+    jint cmd,
+    jint arg1,
+    jint arg2
+) {
+    (void)env;
+    (void)clazz;
+
+    ensure_client_socket();
+    if (client_sock < 0) return JNI_FALSE;
+
+    struct vmouse_packet pkt;
+    pkt.cmd = (int32_t)cmd;
+    pkt.arg1 = (int32_t)arg1;
+    pkt.arg2 = (int32_t)arg2;
+
+    ssize_t sent = sendto(
+        client_sock,
+        &pkt,
+        sizeof(pkt),
+        MSG_DONTWAIT,
+        (const struct sockaddr *)&daemon_addr,
+        sizeof(daemon_addr)
+    );
+
+    if (cmd == CMD_PING && sent == sizeof(pkt)) {
+        struct timeval tv;
+        tv.tv_sec = 0;
+        tv.tv_usec = 40000; // 40ms timeout for PONG
+        setsockopt(client_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        int32_t pong = 0;
+        ssize_t r = recv(client_sock, &pong, sizeof(pong), 0);
+        return (r == sizeof(pong) && pong == 1) ? JNI_TRUE : JNI_FALSE;
+    }
+
+    return (sent == sizeof(pkt)) ? JNI_TRUE : JNI_FALSE;
+}
+
+/* ============================================================================
+ * PART 2: Root Kernel /dev/uinput Daemon
+ * ============================================================================ */
 static int uinput_fd = -1;
 static int sock_fd = -1;
 static volatile int keep_running = 1;
@@ -97,7 +165,7 @@ static inline void emit_move_batched(int fd, int dx, int dy) {
     }
 }
 
-void cleanup_device() {
+void cleanup_device(void) {
     if (sock_fd >= 0) {
         close(sock_fd);
         sock_fd = -1;
@@ -117,7 +185,7 @@ void signal_handler(int sig) {
     exit(0);
 }
 
-int init_uinput() {
+int init_uinput(void) {
     int fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
     if (fd < 0) {
         fd = open("/dev/input/uinput", O_WRONLY | O_NONBLOCK);
@@ -127,14 +195,12 @@ int init_uinput() {
         return -1;
     }
 
-    // Enable relative events
     ioctl(fd, UI_SET_EVBIT, EV_REL);
     ioctl(fd, UI_SET_RELBIT, REL_X);
     ioctl(fd, UI_SET_RELBIT, REL_Y);
     ioctl(fd, UI_SET_RELBIT, REL_WHEEL);
     ioctl(fd, UI_SET_RELBIT, REL_HWHEEL);
 
-    // Enable button keys
     ioctl(fd, UI_SET_EVBIT, EV_KEY);
     ioctl(fd, UI_SET_KEYBIT, BTN_LEFT);
     ioctl(fd, UI_SET_KEYBIT, BTN_RIGHT);
@@ -142,7 +208,6 @@ int init_uinput() {
     ioctl(fd, UI_SET_KEYBIT, BTN_SIDE);
     ioctl(fd, UI_SET_KEYBIT, BTN_EXTRA);
 
-    // Enable sync events
     ioctl(fd, UI_SET_EVBIT, EV_SYN);
 
     struct uinput_user_dev uidev;
@@ -167,14 +232,13 @@ int init_uinput() {
 
     LOGI("Virtual mouse device successfully created in kernel!");
 
-    // Wake up Android PointerController immediately
     usleep(40000);
     emit_move_batched(fd, 1, 1);
 
     return fd;
 }
 
-int init_fast_socket() {
+int init_fast_socket(void) {
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) {
         LOGE("Failed to create UDP socket: %s", strerror(errno));
@@ -264,7 +328,6 @@ int main(int argc, char *argv[]) {
     signal(SIGTERM, signal_handler);
     signal(SIGHUP, signal_handler);
 
-    // Elevate scheduling priority to maximum real-time responsiveness
     setpriority(PRIO_PROCESS, 0, -20);
     struct sched_param sp;
     memset(&sp, 0, sizeof(sp));
@@ -309,7 +372,7 @@ int main(int argc, char *argv[]) {
             execute_non_move_packet(&pkt, &client_addr, client_len);
         }
 
-        // Immediately drain any additional packets already queued in the kernel socket buffer
+        // Drain all queued packets in the socket buffer immediately
         while (keep_running) {
             client_len = sizeof(client_addr);
             ssize_t m = recvfrom(sock_fd, &next_pkt, sizeof(next_pkt), MSG_DONTWAIT,
@@ -330,7 +393,6 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        // Emit coalesced movement delta in a single syscall
         if (accum_dx != 0 || accum_dy != 0) {
             emit_move_batched(uinput_fd, accum_dx, accum_dy);
         }
