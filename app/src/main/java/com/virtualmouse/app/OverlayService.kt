@@ -6,6 +6,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
@@ -16,6 +17,9 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.provider.Settings
+import android.service.quicksettings.Tile
+import android.service.quicksettings.TileService
 import android.util.DisplayMetrics
 import android.view.ContextThemeWrapper
 import android.view.Gravity
@@ -130,6 +134,7 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
                 mainHandler.postDelayed({
                     syncDaemonConfigAndBounds()
                     RootMouseController.setTouchGrab(true)
+                    VirtualMouseTileService.requestSync(this)
                 }, 180L)
             }
         }
@@ -309,8 +314,7 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
     }
 
     @SuppressLint("ClickableViewAccessibility", "InflateParams")
-    private fun initFloatingControls()
-        VirtualMouseTileService.requestSync(this) {
+    private fun initFloatingControls() {
         val themedContext = ContextThemeWrapper(this, R.style.Theme_VirtualMouse)
         val inflater = LayoutInflater.from(themedContext)
         controlsView = inflater.inflate(R.layout.layout_overlay_controls, null)
@@ -436,6 +440,7 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
             tvStatus?.text = if (isKeyboardAuto) "TOUCH (KB)" else "TOUCH"
             tvStatus?.setTextColor(0xFF38BDF8.toInt())
         }
+        VirtualMouseTileService.requestSync(this)
     }
 
     private fun createNotificationChannel() {
@@ -515,5 +520,98 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
         }
         RootMouseController.stop()
         VirtualMouseTileService.requestSync(this)
+    }
+}
+
+/**
+ * Quick Settings (QS) Tile to start and stop the Virtual Mouse in a single tap.
+ * - Tapping when OFF -> Starts Virtual Mouse & turns Tile ON (Active)
+ * - Tapping when ON  -> Stops Virtual Mouse & turns Tile OFF (Inactive)
+ */
+class VirtualMouseTileService : TileService() {
+
+    companion object {
+        fun requestSync(context: Context) {
+            try {
+                requestListeningState(
+                    context,
+                    ComponentName(context, VirtualMouseTileService::class.java)
+                )
+            } catch (ignored: Exception) {}
+        }
+    }
+
+    override fun onStartListening() {
+        super.onStartListening()
+        syncTileState()
+    }
+
+    override fun onClick() {
+        super.onClick()
+
+        val currentlyRunning = RootMouseController.isAttached()
+
+        if (currentlyRunning) {
+            val stopIntent = Intent(this, OverlayService::class.java)
+            stopService(stopIntent)
+            RootMouseController.stop()
+            updateTileUi(active = false, subtitleText = "Off")
+        } else {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this)) {
+                Toast.makeText(this, "Grant Overlay Permission first", Toast.LENGTH_LONG).show()
+                val actIntent = Intent(this, MainActivity::class.java).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                    val pending = PendingIntent.getActivity(
+                        this, 0, actIntent,
+                        PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                    )
+                    startActivityAndCollapse(pending)
+                } else {
+                    @Suppress("DEPRECATION")
+                    startActivityAndCollapse(actIntent)
+                }
+                return
+            }
+
+            updateTileUi(active = true, subtitleText = "Starting...")
+
+            RootMouseController.startAsync(this) { success, errorMsg ->
+                if (success) {
+                    val serviceIntent = Intent(this, OverlayService::class.java)
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        startForegroundService(serviceIntent)
+                    } else {
+                        startService(serviceIntent)
+                    }
+                    updateTileUi(active = true, subtitleText = "Active")
+                } else {
+                    updateTileUi(active = false, subtitleText = "Error")
+                    Handler(Looper.getMainLooper()).post {
+                        Toast.makeText(
+                            this,
+                            errorMsg ?: "Failed to start Virtual Mouse (check root)",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    }
+                }
+            }
+        }
+    }
+
+    private fun syncTileState() {
+        val active = RootMouseController.isAttached()
+        updateTileUi(active = active, subtitleText = if (active) "Active" else "Off")
+    }
+
+    private fun updateTileUi(active: Boolean, subtitleText: String) {
+        val tile = qsTile ?: return
+        tile.state = if (active) Tile.STATE_ACTIVE else Tile.STATE_INACTIVE
+        tile.label = "Virtual Mouse"
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            tile.subtitle = subtitleText
+        }
+        tile.updateTile()
     }
 }

@@ -691,17 +691,25 @@ static void process_touch_frame_syn(void) {
             }
         }
 
-        /* Also check if 1st finger is stationary near its anchor while 2nd finger drags */
+        /* Also check if either finger is stationary near its anchor while the other finger drags */
         int first_drift_sq = dist_sq(first_f->screen_x, first_f->screen_y, first_f->anchor_x, first_f->anchor_y);
         int second_drag_sq = dist_sq(second_f->screen_x, second_f->screen_y, second_f->down_x, second_f->down_y);
+        int first_drag_sq = dist_sq(first_f->screen_x, first_f->screen_y, first_f->down_x, first_f->down_y);
 
-        if (!hold_and_drag_mode && !two_finger_scroll_mode &&
-            first_drift_sq < (35 * 35) && second_drag_sq > (10 * 10)) {
-            hold_and_drag_mode = 1;
-            hold_anchor_slot = first_idx;
-            first_f->moved_beyond_tap = 1;
-            second_f->moved_beyond_tap = 1;
-            emit_single_with_syn(uinput_fd, EV_KEY, BTN_LEFT, 1);
+        if (!hold_and_drag_mode && !two_finger_scroll_mode) {
+            if (first_drift_sq < (40 * 40) && second_drag_sq > (10 * 10)) {
+                hold_and_drag_mode = 1;
+                hold_anchor_slot = first_idx;
+                first_f->moved_beyond_tap = 1;
+                second_f->moved_beyond_tap = 1;
+                emit_single_with_syn(uinput_fd, EV_KEY, BTN_LEFT, 1);
+            } else if (second_drag_sq < (35 * 35) && first_drag_sq > (18 * 18)) {
+                hold_and_drag_mode = 1;
+                hold_anchor_slot = second_idx;
+                first_f->moved_beyond_tap = 1;
+                second_f->moved_beyond_tap = 1;
+                emit_single_with_syn(uinput_fd, EV_KEY, BTN_LEFT, 1);
+            }
         }
 
         if (hold_and_drag_mode) {
