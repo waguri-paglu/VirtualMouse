@@ -121,6 +121,7 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
 
         initImeSensorWindow()
         initFloatingControls()
+        VirtualMouseTileService.requestSync(this)
 
         RootMouseController.startAsync(this) { success, _ ->
             if (!success) {
@@ -308,7 +309,8 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
     }
 
     @SuppressLint("ClickableViewAccessibility", "InflateParams")
-    private fun initFloatingControls() {
+    private fun initFloatingControls()
+        VirtualMouseTileService.requestSync(this) {
         val themedContext = ContextThemeWrapper(this, R.style.Theme_VirtualMouse)
         val inflater = LayoutInflater.from(themedContext)
         controlsView = inflater.inflate(R.layout.layout_overlay_controls, null)
@@ -512,5 +514,6 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
             try { windowManager.removeView(it) } catch (ignored: Exception) {}
         }
         RootMouseController.stop()
+        VirtualMouseTileService.requestSync(this)
     }
 }

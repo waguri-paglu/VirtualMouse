@@ -100,7 +100,8 @@ jobs:
             - **Bi-Directional 3-Finger Tap**: Tap anywhere on the screen with **3 fingers** to instantly swap between **Trackpad Mode** and **Normal Touch Mode** in both directions—even when the floating buttons overlay is hidden.
             - **Zero Conflict with 2-Finger Scroll**: 2-finger smooth wheel scrolling (`REL_WHEEL` / `REL_HWHEEL`) triggers cleanly when two fingers touch down simultaneously and glide together.
             
-            #### ⌨️ Smart Automation & Hideable Overlay
+            #### ⌨️ Quick Settings Tile, Smart Automation & Hideable Overlay
+            - **Quick Settings (QS) Toggle Tile**: Start and stop Virtual Mouse from anywhere in a single tap from your notification shade Quick Settings panel.
             - **Auto-Touch on Keyboard (IME)**: Persistent root monitor detects when Android's soft keyboard opens (`dumpsys input_method` / `InputMethod` window state), automatically switches to **Touch Mode (`TOUCH (KB)`)** so you can type immediately, and switches right back to **Trackpad Mode** as soon as the keyboard closes.
             - **Hide Floating Mouse Buttons (`✕`)**: Tap `✕` directly on the floating dock, toggle the switch in **Home / Settings**, or use the **"Show/Hide Buttons"** button in the persistent notification to hide the on-screen buttons completely.
             

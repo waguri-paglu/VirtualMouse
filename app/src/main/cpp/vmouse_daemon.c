@@ -672,13 +672,15 @@ static void process_touch_frame_syn(void) {
         if (new_trackpad_finger_down) {
             first_f->anchor_x = first_f->screen_x;
             first_f->anchor_y = first_f->screen_y;
+            second_f->prev_x = second_f->screen_x;
+            second_f->prev_y = second_f->screen_y;
             int64_t time_gap = second_f->down_time_ms - first_f->down_time_ms;
 
             /*
-             * If 1st finger was already held on the screen for >= 90ms before 2nd finger touched down,
+             * If 1st finger was already on the screen for >= 65ms before 2nd finger touched down,
              * immediately engage Hold-and-Drag (1st finger holds LMB, 2nd finger moves cursor)!
              */
-            if (time_gap >= 90 && !two_finger_scroll_mode) {
+            if (time_gap >= 65 && !two_finger_scroll_mode) {
                 if (!hold_and_drag_mode) {
                     hold_and_drag_mode = 1;
                     hold_anchor_slot = first_idx;
@@ -694,7 +696,7 @@ static void process_touch_frame_syn(void) {
         int second_drag_sq = dist_sq(second_f->screen_x, second_f->screen_y, second_f->down_x, second_f->down_y);
 
         if (!hold_and_drag_mode && !two_finger_scroll_mode &&
-            first_drift_sq < (25 * 25) && second_drag_sq > (20 * 20)) {
+            first_drift_sq < (35 * 35) && second_drag_sq > (10 * 10)) {
             hold_and_drag_mode = 1;
             hold_anchor_slot = first_idx;
             first_f->moved_beyond_tap = 1;
@@ -869,17 +871,10 @@ static void handle_touch_events(void) {
                         slots[current_slot].just_up = 1;
                     }
                 }
-            } else if (code == ABS_MT_POSITION_X || code == ABS_X) {
+            } else if (code == ABS_MT_POSITION_X) {
                 slots[current_slot].raw_x = val;
-            } else if (code == ABS_MT_POSITION_Y || code == ABS_Y) {
+            } else if (code == ABS_MT_POSITION_Y) {
                 slots[current_slot].raw_y = val;
-            }
-        } else if (type == EV_KEY && code == BTN_TOUCH) {
-            if (val == 1 && !slots[current_slot].active) {
-                slots[current_slot].active = 1;
-                slots[current_slot].just_down = 1;
-            } else if (val == 0 && slots[current_slot].active) {
-                slots[current_slot].just_up = 1;
             }
         } else if (type == EV_SYN && code == SYN_REPORT) {
             process_touch_frame_syn();
