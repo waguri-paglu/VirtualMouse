@@ -280,6 +280,66 @@ static inline int map_button(int btn) {
     }
 }
 
+static int deferred_grab_target = -1;
+static int64_t deferred_grab_deadline_ms = 0;
+
+static int has_active_fingers(void) {
+    for (int i = 0; i < MAX_SLOTS; i++) {
+        if (slots[i].active && !slots[i].just_up) return 1;
+    }
+    return 0;
+}
+
+/*
+ * Injects a complete multi-touch slot release sweep (Slots 0..9 -> ABS_MT_TRACKING_ID = -1,
+ * ABS_MT_SLOT = 0, BTN_TOUCH = 0, SYN_REPORT) into touch_fd while ungrabbed so Android's
+ * InputReader never retains a stuck ghost finger across EVIOCGRAB transitions.
+ */
+static void flush_android_touch_slots(void) {
+    if (touch_fd < 0) return;
+    struct input_event ev[24];
+    int n = 0;
+    memset(ev, 0, sizeof(ev));
+
+    for (int s = 0; s < MAX_SLOTS; s++) {
+        ev[n].type = EV_ABS;
+        ev[n].code = ABS_MT_SLOT;
+        ev[n].value = s;
+        n++;
+
+        ev[n].type = EV_ABS;
+        ev[n].code = ABS_MT_TRACKING_ID;
+        ev[n].value = -1;
+        n++;
+    }
+
+    ev[n].type = EV_ABS;
+    ev[n].code = ABS_MT_SLOT;
+    ev[n].value = 0;
+    n++;
+
+    ev[n].type = EV_KEY;
+    ev[n].code = BTN_TOUCH;
+    ev[n].value = 0;
+    n++;
+
+    ev[n].type = EV_KEY;
+    ev[n].code = BTN_TOOL_FINGER;
+    ev[n].value = 0;
+    n++;
+
+    ev[n].type = EV_SYN;
+    ev[n].code = SYN_REPORT;
+    ev[n].value = 0;
+    n++;
+
+    if (write(touch_fd, ev, sizeof(struct input_event) * n) < 0) {}
+
+    struct input_event drain[64];
+    while (read(touch_fd, drain, sizeof(drain)) > 0) {}
+    current_slot = 0;
+}
+
 static void sync_slot_state_from_kernel(void) {
     if (touch_fd < 0) return;
     struct input_absinfo si;
@@ -297,9 +357,14 @@ static void sync_slot_state_from_kernel(void) {
     }
 }
 
-static void set_touch_grab(int enable) {
+static void apply_touch_grab_now(int enable) {
     if (touch_fd < 0) return;
+    deferred_grab_target = -1;
+    deferred_grab_deadline_ms = 0;
+
     if (enable && !is_grabbed) {
+        /* Cleanly release all slots to Android InputReader BEFORE grabbing */
+        flush_android_touch_slots();
         if (ioctl(touch_fd, EVIOCGRAB, 1) == 0) {
             is_grabbed = 1;
             memset(slots, 0, sizeof(slots));
@@ -320,6 +385,8 @@ static void set_touch_grab(int enable) {
     } else if (!enable && is_grabbed) {
         ioctl(touch_fd, EVIOCGRAB, 0);
         is_grabbed = 0;
+        /* Cleanly reset all slots & current_slot=0 to Android InputReader AFTER ungrabbing */
+        flush_android_touch_slots();
         memset(slots, 0, sizeof(slots));
         sync_slot_state_from_kernel();
         two_finger_scroll_mode = 0;
@@ -336,11 +403,27 @@ static void set_touch_grab(int enable) {
     }
 }
 
+static void set_touch_grab(int enable) {
+    if (touch_fd < 0) return;
+    if ((enable && is_grabbed) || (!enable && !is_grabbed)) {
+        deferred_grab_target = -1;
+        return;
+    }
+    if (!has_active_fingers()) {
+        apply_touch_grab_now(enable);
+    } else {
+        /* Wait until fingers lift off the glass so no slot is cut off mid-touch */
+        deferred_grab_target = enable ? 1 : 0;
+        deferred_grab_deadline_ms = now_ms() + 300;
+    }
+}
+
 void cleanup_device(void) {
     if (touch_fd >= 0) {
         if (is_grabbed) {
             ioctl(touch_fd, EVIOCGRAB, 0);
             is_grabbed = 0;
+            flush_android_touch_slots();
         }
         close(touch_fd);
         touch_fd = -1;
@@ -374,7 +457,10 @@ static int open_touchscreen_device(void) {
 
     for (int i = 0; i < 32; i++) {
         snprintf(path, sizeof(path), "/dev/input/event%d", i);
-        int fd = open(path, O_RDONLY | O_NONBLOCK);
+        int fd = open(path, O_RDWR | O_NONBLOCK);
+        if (fd < 0) {
+            fd = open(path, O_RDONLY | O_NONBLOCK);
+        }
         if (fd < 0) continue;
 
         memset(name, 0, sizeof(name));
@@ -640,15 +726,20 @@ static void process_touch_frame_syn(void) {
                 slots[i].role = ROLE_NONE;
             }
         }
-        if (total_active_fingers == 0 && gesture_max_fingers > 0) {
-            int64_t gesture_dur = now - gesture_start_ms;
-            if (three_finger_tap_enabled && gesture_max_fingers == 3 &&
-                !gesture_moved_too_far && gesture_dur < 420) {
+        if (total_active_fingers == 0) {
+            if (gesture_max_fingers > 0) {
+                int64_t gesture_dur = now - gesture_start_ms;
+                if (three_finger_tap_enabled && gesture_max_fingers == 3 &&
+                    !gesture_moved_too_far && gesture_dur < 420) {
+                    gesture_max_fingers = 0;
+                    apply_touch_grab_now(1);
+                    return;
+                }
                 gesture_max_fingers = 0;
-                set_touch_grab(1);
-                return;
             }
-            gesture_max_fingers = 0;
+            if (deferred_grab_target != -1) {
+                apply_touch_grab_now(deferred_grab_target);
+            }
         }
         return;
     }
@@ -668,52 +759,63 @@ static void process_touch_frame_syn(void) {
         struct touch_slot *first_f = &slots[first_idx];
         struct touch_slot *second_f = &slots[second_idx];
 
-        /* When 2nd finger just touched down, snapshot 1st finger's current position as anchor! */
+        /*
+         * Disjoint 2-Finger Classifier (2-Finger Scroll vs. Bi-Directional Hold + Drag):
+         * When the 2nd finger lands on the trackpad, we snapshot both fingers' positions
+         * (anchor_x, anchor_y) and classify based on actual movement from the 2-finger anchor:
+         * - 2-Finger Scroll: BOTH fingers move > 14px (d0 > 14px && d1 > 14px)
+         * - Hold + Drag (Both Finger Orders): ONE finger stays stationary (<= 14px) while
+         *   the OTHER finger moves > 22px!
+         */
         if (new_trackpad_finger_down) {
-            first_f->anchor_x = first_f->screen_x;
-            first_f->anchor_y = first_f->screen_y;
+            s0->anchor_x = s0->screen_x;
+            s0->anchor_y = s0->screen_y;
+            s1->anchor_x = s1->screen_x;
+            s1->anchor_y = s1->screen_y;
             second_f->prev_x = second_f->screen_x;
             second_f->prev_y = second_f->screen_y;
-            int64_t time_gap = second_f->down_time_ms - first_f->down_time_ms;
 
-            /*
-             * If 1st finger was already on the screen for >= 65ms before 2nd finger touched down,
-             * immediately engage Hold-and-Drag (1st finger holds LMB, 2nd finger moves cursor)!
-             */
-            if (time_gap >= 65 && !two_finger_scroll_mode) {
-                if (!hold_and_drag_mode) {
-                    hold_and_drag_mode = 1;
-                    hold_anchor_slot = first_idx;
-                    first_f->moved_beyond_tap = 1;
-                    second_f->moved_beyond_tap = 1;
-                    emit_single_with_syn(uinput_fd, EV_KEY, BTN_LEFT, 1);
-                }
-            }
-        }
-
-        /* Also check if either finger is stationary near its anchor while the other finger drags */
-        int first_drift_sq = dist_sq(first_f->screen_x, first_f->screen_y, first_f->anchor_x, first_f->anchor_y);
-        int second_drag_sq = dist_sq(second_f->screen_x, second_f->screen_y, second_f->down_x, second_f->down_y);
-        int first_drag_sq = dist_sq(first_f->screen_x, first_f->screen_y, first_f->down_x, first_f->down_y);
-
-        if (!hold_and_drag_mode && !two_finger_scroll_mode) {
-            if (first_drift_sq < (40 * 40) && second_drag_sq > (10 * 10)) {
-                hold_and_drag_mode = 1;
+            if (hold_and_drag_mode) {
+                /* Multi-stroke continuation: the finger that remained on screen is the hold anchor */
                 hold_anchor_slot = first_idx;
                 first_f->moved_beyond_tap = 1;
                 second_f->moved_beyond_tap = 1;
-                emit_single_with_syn(uinput_fd, EV_KEY, BTN_LEFT, 1);
-            } else if (second_drag_sq < (35 * 35) && first_drag_sq > (18 * 18)) {
+            }
+        }
+
+        int d0_anchor_sq = dist_sq(s0->screen_x, s0->screen_y, s0->anchor_x, s0->anchor_y);
+        int d1_anchor_sq = dist_sq(s1->screen_x, s1->screen_y, s1->anchor_x, s1->anchor_y);
+        int mid_x = (s0->screen_x + s1->screen_x) / 2;
+        int mid_y = (s0->screen_y + s1->screen_y) / 2;
+
+        if (!hold_and_drag_mode && !two_finger_scroll_mode) {
+            if (d0_anchor_sq > (14 * 14) && d1_anchor_sq > (14 * 14)) {
+                /* Both fingers moved past 14px -> 2-Finger Scroll! */
+                two_finger_scroll_mode = 1;
+                last_mid_x = (s0->anchor_x + s1->anchor_x) / 2;
+                last_mid_y = (s0->anchor_y + s1->anchor_y) / 2;
+                rem_scroll_x = 0.0f;
+                rem_scroll_y = 0.0f;
+                s0->moved_beyond_tap = 1;
+                s1->moved_beyond_tap = 1;
+            } else if (d0_anchor_sq <= (14 * 14) && d1_anchor_sq > (22 * 22)) {
+                /* Finger s0 is stationary (<=14px) and Finger s1 is dragging (>22px) */
                 hold_and_drag_mode = 1;
-                hold_anchor_slot = second_idx;
-                first_f->moved_beyond_tap = 1;
-                second_f->moved_beyond_tap = 1;
+                hold_anchor_slot = idx0;
+                s0->moved_beyond_tap = 1;
+                s1->moved_beyond_tap = 1;
+                emit_single_with_syn(uinput_fd, EV_KEY, BTN_LEFT, 1);
+            } else if (d1_anchor_sq <= (14 * 14) && d0_anchor_sq > (22 * 22)) {
+                /* Finger s1 is stationary (<=14px) and Finger s0 is dragging (>22px) */
+                hold_and_drag_mode = 1;
+                hold_anchor_slot = idx1;
+                s0->moved_beyond_tap = 1;
+                s1->moved_beyond_tap = 1;
                 emit_single_with_syn(uinput_fd, EV_KEY, BTN_LEFT, 1);
             }
         }
 
         if (hold_and_drag_mode) {
-            /* Only the 2nd (moving) finger controls the cursor! */
             struct touch_slot *mover = (hold_anchor_slot == idx0) ? s1 : s0;
             int raw_dx = mover->screen_x - mover->prev_x;
             int raw_dy = mover->screen_y - mover->prev_y;
@@ -724,21 +826,7 @@ static void process_touch_frame_syn(void) {
 
             emit_scaled_move(raw_dx, raw_dy);
         } else {
-            /* Standard 2-Finger Scroll when both fingers were placed together (<90ms) and move together */
-            int mid_x = (s0->screen_x + s1->screen_x) / 2;
-            int mid_y = (s0->screen_y + s1->screen_y) / 2;
-
-            if (!two_finger_scroll_mode) {
-                if (first_drift_sq > (20 * 20) && second_drag_sq > (20 * 20)) {
-                    two_finger_scroll_mode = 1;
-                    last_mid_x = mid_x;
-                    last_mid_y = mid_y;
-                    rem_scroll_x = 0.0f;
-                    rem_scroll_y = 0.0f;
-                    s0->moved_beyond_tap = 1;
-                    s1->moved_beyond_tap = 1;
-                }
-            } else {
+            if (two_finger_scroll_mode) {
                 int dy = mid_y - last_mid_y;
                 int dx = mid_x - last_mid_x;
                 last_mid_x = mid_x;
@@ -798,11 +886,18 @@ static void process_touch_frame_syn(void) {
             } else if (s->role == ROLE_BTN_R) {
                 emit_single_with_syn(uinput_fd, EV_KEY, BTN_RIGHT, 0);
             } else if (s->role == ROLE_TRACKPAD) {
-                if (hold_and_drag_mode && i == hold_anchor_slot) {
-                    /* Anchor finger lifted -> release BTN_LEFT! */
+                if (hold_and_drag_mode && (i == hold_anchor_slot || hold_anchor_slot == -1)) {
+                    /* Anchor (hold) finger lifted -> release BTN_LEFT and let remaining finger move normally! */
                     hold_and_drag_mode = 0;
                     hold_anchor_slot = -1;
                     emit_single_with_syn(uinput_fd, EV_KEY, BTN_LEFT, 0);
+                    for (int k = 0; k < MAX_SLOTS; k++) {
+                        if (slots[k].active) {
+                            slots[k].moved_beyond_tap = 1;
+                            slots[k].prev_x = slots[k].screen_x;
+                            slots[k].prev_y = slots[k].screen_y;
+                        }
+                    }
                 } else if (!hold_and_drag_mode && !two_finger_scroll_mode &&
                            gesture_max_fingers == 1 && !s->moved_beyond_tap && duration < 220) {
                     /* 1-Finger Tap -> Left Click */
@@ -847,7 +942,9 @@ static void process_touch_frame_syn(void) {
 
         if (pending_mode_swap) {
             pending_mode_swap = 0;
-            set_touch_grab(0);
+            apply_touch_grab_now(0);
+        } else if (deferred_grab_target != -1) {
+            apply_touch_grab_now(deferred_grab_target);
         }
     }
 }
@@ -993,7 +1090,10 @@ int main(int argc, char *argv[]) {
             nfds = 2;
         }
 
-        int ret = poll(pfds, nfds, 250);
+        int ret = poll(pfds, nfds, 60);
+        if (deferred_grab_target != -1 && now_ms() >= deferred_grab_deadline_ms) {
+            apply_touch_grab_now(deferred_grab_target);
+        }
         if (ret < 0) {
             if (errno == EINTR) continue;
             break;

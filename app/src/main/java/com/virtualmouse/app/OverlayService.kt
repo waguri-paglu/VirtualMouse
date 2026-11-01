@@ -123,7 +123,6 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
             }
         }
 
-        initImeSensorWindow()
         initFloatingControls()
         VirtualMouseTileService.requestSync(this)
 
@@ -512,9 +511,6 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
         mainHandler.removeCallbacksAndMessages(null)
         prefs.unregisterOnSharedPreferenceChangeListener(this)
         RootMouseController.setTouchGrab(false)
-        imeSensorView?.let {
-            try { windowManager.removeView(it) } catch (ignored: Exception) {}
-        }
         controlsView?.let {
             try { windowManager.removeView(it) } catch (ignored: Exception) {}
         }
