@@ -205,6 +205,7 @@ static float rem_scroll_x = 0.0f;
 static int two_finger_scroll_mode = 0;
 static int hold_and_drag_mode = 0;
 static int hold_anchor_slot = -1;
+static int64_t two_finger_start_ms = 0;
 static int last_mid_x = 0;
 static int last_mid_y = 0;
 
@@ -243,6 +244,42 @@ static inline void emit_single_with_syn(int fd, int type, int code, int val) {
     ev[1].code = SYN_REPORT;
     ev[1].value = 0;
     if (write(fd, ev, sizeof(ev)) < 0) {}
+}
+
+static inline void emit_wheel_scroll(int fd, int sy, int sx) {
+    if (sy == 0 && sx == 0) return;
+    struct input_event ev[5];
+    int n = 0;
+    memset(ev, 0, sizeof(ev));
+    if (sy != 0) {
+        ev[n].type = EV_REL;
+        ev[n].code = REL_WHEEL;
+        ev[n].value = sy;
+        n++;
+#ifdef REL_WHEEL_HI_RES
+        ev[n].type = EV_REL;
+        ev[n].code = REL_WHEEL_HI_RES;
+        ev[n].value = sy * 120;
+        n++;
+#endif
+    }
+    if (sx != 0) {
+        ev[n].type = EV_REL;
+        ev[n].code = REL_HWHEEL;
+        ev[n].value = sx;
+        n++;
+#ifdef REL_HWHEEL_HI_RES
+        ev[n].type = EV_REL;
+        ev[n].code = REL_HWHEEL_HI_RES;
+        ev[n].value = sx * 120;
+        n++;
+#endif
+    }
+    ev[n].type = EV_SYN;
+    ev[n].code = SYN_REPORT;
+    ev[n].value = 0;
+    n++;
+    if (write(fd, ev, sizeof(struct input_event) * n) < 0) {}
 }
 
 static inline void emit_move_batched(int fd, int dx, int dy) {
@@ -521,6 +558,12 @@ static int init_uinput(void) {
     ioctl(fd, UI_SET_RELBIT, REL_Y);
     ioctl(fd, UI_SET_RELBIT, REL_WHEEL);
     ioctl(fd, UI_SET_RELBIT, REL_HWHEEL);
+#ifdef REL_WHEEL_HI_RES
+    ioctl(fd, UI_SET_RELBIT, REL_WHEEL_HI_RES);
+#endif
+#ifdef REL_HWHEEL_HI_RES
+    ioctl(fd, UI_SET_RELBIT, REL_HWHEEL_HI_RES);
+#endif
 
     ioctl(fd, UI_SET_EVBIT, EV_KEY);
     ioctl(fd, UI_SET_KEYBIT, BTN_LEFT);
@@ -760,12 +803,12 @@ static void process_touch_frame_syn(void) {
         struct touch_slot *second_f = &slots[second_idx];
 
         /*
-         * Disjoint 2-Finger Classifier (2-Finger Scroll vs. Bi-Directional Hold + Drag):
-         * When the 2nd finger lands on the trackpad, we snapshot both fingers' positions
-         * (anchor_x, anchor_y) and classify based on actual movement from the 2-finger anchor:
-         * - 2-Finger Scroll: BOTH fingers move > 14px (d0 > 14px && d1 > 14px)
-         * - Hold + Drag (Both Finger Orders): ONE finger stays stationary (<= 14px) while
-         *   the OTHER finger moves > 22px!
+         * 2-Finger Scroll vs. Bi-Directional Hold + Drag Classifier:
+         * - 2-Finger Scroll: Both fingers move (> 12px each). Also if Hold+Drag started
+         *   tentatively because one finger slipped first, and the "stationary" finger also
+         *   moves > 26px within 250ms, it automatically upgrades into 2-Finger Scroll!
+         * - Bi-Directional Hold + Drag: One finger stays genuinely parked in place (<= 15px)
+         *   for >= 65ms while the other finger drags >= 48px!
          */
         if (new_trackpad_finger_down) {
             s0->anchor_x = s0->screen_x;
@@ -774,6 +817,7 @@ static void process_touch_frame_syn(void) {
             s1->anchor_y = s1->screen_y;
             second_f->prev_x = second_f->screen_x;
             second_f->prev_y = second_f->screen_y;
+            two_finger_start_ms = now;
 
             if (hold_and_drag_mode) {
                 /* Multi-stroke continuation: the finger that remained on screen is the hold anchor */
@@ -787,10 +831,11 @@ static void process_touch_frame_syn(void) {
         int d1_anchor_sq = dist_sq(s1->screen_x, s1->screen_y, s1->anchor_x, s1->anchor_y);
         int mid_x = (s0->screen_x + s1->screen_x) / 2;
         int mid_y = (s0->screen_y + s1->screen_y) / 2;
+        int64_t two_finger_elapsed = now - two_finger_start_ms;
 
         if (!hold_and_drag_mode && !two_finger_scroll_mode) {
-            if (d0_anchor_sq > (14 * 14) && d1_anchor_sq > (14 * 14)) {
-                /* Both fingers moved past 14px -> 2-Finger Scroll! */
+            if (d0_anchor_sq > (12 * 12) && d1_anchor_sq > (12 * 12)) {
+                /* Both fingers moved past 12px -> 2-Finger Scroll! */
                 two_finger_scroll_mode = 1;
                 last_mid_x = (s0->anchor_x + s1->anchor_x) / 2;
                 last_mid_y = (s0->anchor_y + s1->anchor_y) / 2;
@@ -798,20 +843,38 @@ static void process_touch_frame_syn(void) {
                 rem_scroll_y = 0.0f;
                 s0->moved_beyond_tap = 1;
                 s1->moved_beyond_tap = 1;
-            } else if (d0_anchor_sq <= (14 * 14) && d1_anchor_sq > (22 * 22)) {
-                /* Finger s0 is stationary (<=14px) and Finger s1 is dragging (>22px) */
+            } else if (two_finger_elapsed >= 65 &&
+                       d0_anchor_sq <= (15 * 15) && d1_anchor_sq > (48 * 48)) {
+                /* Finger s0 is held stationary (<=15px for >=65ms) and Finger s1 dragged >48px */
                 hold_and_drag_mode = 1;
                 hold_anchor_slot = idx0;
                 s0->moved_beyond_tap = 1;
                 s1->moved_beyond_tap = 1;
                 emit_single_with_syn(uinput_fd, EV_KEY, BTN_LEFT, 1);
-            } else if (d1_anchor_sq <= (14 * 14) && d0_anchor_sq > (22 * 22)) {
-                /* Finger s1 is stationary (<=14px) and Finger s0 is dragging (>22px) */
+            } else if (two_finger_elapsed >= 65 &&
+                       d1_anchor_sq <= (15 * 15) && d0_anchor_sq > (48 * 48)) {
+                /* Finger s1 is held stationary (<=15px for >=65ms) and Finger s0 dragged >48px */
                 hold_and_drag_mode = 1;
                 hold_anchor_slot = idx1;
                 s0->moved_beyond_tap = 1;
                 s1->moved_beyond_tap = 1;
                 emit_single_with_syn(uinput_fd, EV_KEY, BTN_LEFT, 1);
+            }
+        } else if (hold_and_drag_mode && two_finger_elapsed < 260) {
+            /*
+             * Safety recovery: if the "stationary" anchor finger ALSO slides > 28px within 260ms,
+             * the user is actually sliding both fingers to 2-finger scroll!
+             */
+            int anchor_drift_sq = (hold_anchor_slot == idx0) ? d0_anchor_sq : d1_anchor_sq;
+            if (anchor_drift_sq > (28 * 28)) {
+                hold_and_drag_mode = 0;
+                hold_anchor_slot = -1;
+                emit_single_with_syn(uinput_fd, EV_KEY, BTN_LEFT, 0);
+                two_finger_scroll_mode = 1;
+                last_mid_x = mid_x;
+                last_mid_y = mid_y;
+                rem_scroll_x = 0.0f;
+                rem_scroll_y = 0.0f;
             }
         }
 
@@ -832,18 +895,15 @@ static void process_touch_frame_syn(void) {
                 last_mid_x = mid_x;
                 last_mid_y = mid_y;
 
-                rem_scroll_y += (float)dy * scroll_sens * 0.18f;
-                rem_scroll_x += (float)dx * scroll_sens * 0.18f;
+                rem_scroll_y += (float)dy * scroll_sens * 0.32f;
+                rem_scroll_x += (float)dx * scroll_sens * 0.32f;
 
                 int sy = (int)rem_scroll_y;
                 int sx = (int)rem_scroll_x;
-                if (sy != 0) {
+                if (sy != 0 || sx != 0) {
                     rem_scroll_y -= (float)sy;
-                    emit_single_with_syn(uinput_fd, EV_REL, REL_WHEEL, sy);
-                }
-                if (sx != 0) {
                     rem_scroll_x -= (float)sx;
-                    emit_single_with_syn(uinput_fd, EV_REL, REL_HWHEEL, sx);
+                    emit_wheel_scroll(uinput_fd, sy, sx);
                 }
             }
             s0->prev_x = s0->screen_x;
