@@ -1,14 +1,13 @@
 /*
- * Kernel-Level EVIOCGRAB + Original /dev/uinput Virtual Mouse Daemon
+ * Virtual Mouse v1.2.0 — Kernel EVIOCGRAB + Original /dev/uinput Engine
  *
- * Why this works with 0 lag and 0 cursor teleporting:
- * 1. Registers a 100% genuine /dev/uinput hardware mouse (EV_REL + BTN_LEFT/BTN_RIGHT)
- *    so Android renders its original native system mouse cursor.
- * 2. Grabs the physical touchscreen (/dev/input/eventX) via ioctl(EVIOCGRAB, 1)
- *    so Android's TouchInputMapper never sees touchscreen touches while in Trackpad Mode,
- *    preventing Android from ever hiding or freezing the native mouse cursor!
- * 3. Reads raw multi-touch events in C and writes relative motion/clicks directly
- *    to /dev/uinput in <50 microseconds with no full-screen overlay blocking clicks.
+ * Features:
+ * 1. Genuine /dev/uinput hardware mouse (EV_REL + BTN_LEFT/BTN_RIGHT/BTN_MIDDLE)
+ * 2. Kernel EVIOCGRAB touchscreen capture in Trackpad Mode (prevents Android TouchInputMapper
+ *    from ever hiding or freezing the native mouse cursor)
+ * 3. Gesture: 1-Finger Hold + 2nd-Finger Drag -> holds BTN_LEFT down and drags cursor
+ * 4. Gesture: Bi-directional 3-Finger Tap -> swaps Trackpad <-> Touch mode in both states!
+ * 5. Dock Zone Mapping: L, MODE, R, and HIDE overlay buttons
  */
 
 #include <stdio.h>
@@ -60,6 +59,11 @@
 #define CMD_SET_DOCK    10
 #define CMD_QUIT        99
 
+/* Callback codes sent from daemon -> Android app on port 29877 */
+#define CB_MODE_TOUCH    0
+#define CB_MODE_TRACKPAD 1
+#define CB_HIDE_OVERLAY  2
+
 struct vmouse_packet {
     int32_t cmd;
     int32_t arg1;
@@ -69,7 +73,7 @@ struct vmouse_packet {
 };
 
 /* ============================================================================
- * PART 1: JNI Client Bridge (In-Process Android App -> Daemon Control)
+ * PART 1: JNI Client Bridge
  * ============================================================================ */
 static int client_sock = -1;
 static struct sockaddr_in daemon_addr;
@@ -147,18 +151,19 @@ static int is_grabbed = 0;
 static int touch_min_x = 0, touch_max_x = 1080;
 static int touch_min_y = 0, touch_max_y = 2400;
 
-/* Current display dimensions & orientation */
+/* Current display dimensions & settings */
 static int screen_w = 1080;
 static int screen_h = 2400;
-static int screen_rotation = 0; /* 0, 1 (90), 2 (180), 3 (270) */
+static int screen_rotation = 0;
 static float pointer_sens = 1.4f;
 static float scroll_sens = 0.5f;
+static int three_finger_tap_enabled = 1;
 
-/* Floating dock rectangle in screen pixel coordinates */
-static int dock_left = 200;
-static int dock_top = 2100;
-static int dock_right = 880;
-static int dock_bottom = 2320;
+/* Floating dock rectangle in screen pixel coordinates (0,0,0,0 when hidden) */
+static int dock_left = 0;
+static int dock_top = 0;
+static int dock_right = 0;
+static int dock_bottom = 0;
 
 #define MAX_SLOTS 10
 #define ROLE_NONE     0
@@ -166,6 +171,7 @@ static int dock_bottom = 2320;
 #define ROLE_BTN_L    2
 #define ROLE_BTN_MODE 3
 #define ROLE_BTN_R    4
+#define ROLE_BTN_HIDE 5
 
 struct touch_slot {
     int active;
@@ -192,10 +198,20 @@ static float rem_dx = 0.0f;
 static float rem_dy = 0.0f;
 static float rem_scroll_y = 0.0f;
 static float rem_scroll_x = 0.0f;
-static int two_finger_session = 0;
+
+/* Multi-finger gesture state tracking */
+static int two_finger_scroll_mode = 0;
+static int hold_and_drag_mode = 0;
+static int hold_anchor_slot = -1;
 static int last_mid_x = 0;
 static int last_mid_y = 0;
-static int pending_ungrab_on_release = 0;
+
+/* 3-finger tap detector (works in BOTH grabbed and ungrabbed modes!) */
+static int gesture_max_fingers = 0;
+static int64_t gesture_start_ms = 0;
+static int gesture_moved_too_far = 0;
+static int pending_mode_swap = 0;
+static int pending_hide_overlay = 0;
 
 static int64_t now_ms(void) {
     struct timeval tv;
@@ -203,7 +219,7 @@ static int64_t now_ms(void) {
     return (int64_t)tv.tv_sec * 1000LL + (tv.tv_usec / 1000);
 }
 
-static void notify_app_mode(int mode_grabbed) {
+static void notify_app_event(int32_t event_code) {
     if (sock_fd < 0) return;
     struct sockaddr_in app_addr;
     memset(&app_addr, 0, sizeof(app_addr));
@@ -211,8 +227,7 @@ static void notify_app_mode(int mode_grabbed) {
     app_addr.sin_port = htons(APP_CALLBACK_PORT);
     app_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
-    int32_t msg = mode_grabbed ? 1 : 0;
-    sendto(sock_fd, &msg, sizeof(msg), MSG_DONTWAIT,
+    sendto(sock_fd, &event_code, sizeof(event_code), MSG_DONTWAIT,
            (const struct sockaddr *)&app_addr, sizeof(app_addr));
 }
 
@@ -263,33 +278,40 @@ static inline int map_button(int btn) {
     }
 }
 
+static void sync_slot_state_from_kernel(void) {
+    if (touch_fd < 0) return;
+    struct input_absinfo si;
+    if (ioctl(touch_fd, EVIOCGABS(ABS_MT_SLOT), &si) == 0) {
+        if (si.value >= 0 && si.value < MAX_SLOTS) current_slot = si.value;
+    }
+    struct input_absinfo ax, ay;
+    int init_x = (touch_min_x + touch_max_x) / 2;
+    int init_y = (touch_min_y + touch_max_y) / 2;
+    if (ioctl(touch_fd, EVIOCGABS(ABS_MT_POSITION_X), &ax) == 0) init_x = ax.value;
+    if (ioctl(touch_fd, EVIOCGABS(ABS_MT_POSITION_Y), &ay) == 0) init_y = ay.value;
+    for (int k = 0; k < MAX_SLOTS; k++) {
+        slots[k].raw_x = init_x;
+        slots[k].raw_y = init_y;
+    }
+}
+
 static void set_touch_grab(int enable) {
     if (touch_fd < 0) return;
     if (enable && !is_grabbed) {
         if (ioctl(touch_fd, EVIOCGRAB, 1) == 0) {
             is_grabbed = 1;
             memset(slots, 0, sizeof(slots));
-            struct input_absinfo si;
-            if (ioctl(touch_fd, EVIOCGABS(ABS_MT_SLOT), &si) == 0) {
-                if (si.value >= 0 && si.value < MAX_SLOTS) current_slot = si.value;
-            }
-            struct input_absinfo ax, ay;
-            int init_x = (touch_min_x + touch_max_x) / 2;
-            int init_y = (touch_min_y + touch_max_y) / 2;
-            if (ioctl(touch_fd, EVIOCGABS(ABS_MT_POSITION_X), &ax) == 0) init_x = ax.value;
-            if (ioctl(touch_fd, EVIOCGABS(ABS_MT_POSITION_Y), &ay) == 0) init_y = ay.value;
-            for (int k = 0; k < MAX_SLOTS; k++) {
-                slots[k].raw_x = init_x;
-                slots[k].raw_y = init_y;
-            }
+            sync_slot_state_from_kernel();
             rem_dx = 0.0f;
             rem_dy = 0.0f;
-            two_finger_session = 0;
-            pending_ungrab_on_release = 0;
+            two_finger_scroll_mode = 0;
+            hold_and_drag_mode = 0;
+            hold_anchor_slot = -1;
+            gesture_max_fingers = 0;
+            pending_mode_swap = 0;
             LOGI("Touchscreen EVIOCGRAB enabled (Trackpad Mode)");
-            /* Nudge native cursor so it is immediately visible */
             emit_move_batched(uinput_fd, 1, 1);
-            notify_app_mode(1);
+            notify_app_event(CB_MODE_TRACKPAD);
         } else {
             LOGE("EVIOCGRAB=1 failed: %s", strerror(errno));
         }
@@ -297,11 +319,18 @@ static void set_touch_grab(int enable) {
         ioctl(touch_fd, EVIOCGRAB, 0);
         is_grabbed = 0;
         memset(slots, 0, sizeof(slots));
-        pending_ungrab_on_release = 0;
-        /* Ensure left button is released */
+        sync_slot_state_from_kernel();
+        two_finger_scroll_mode = 0;
+        if (hold_and_drag_mode) {
+            hold_and_drag_mode = 0;
+            emit_single_with_syn(uinput_fd, EV_KEY, BTN_LEFT, 0);
+        }
+        hold_anchor_slot = -1;
+        gesture_max_fingers = 0;
+        pending_mode_swap = 0;
         emit_single_with_syn(uinput_fd, EV_KEY, BTN_LEFT, 0);
         LOGI("Touchscreen EVIOCGRAB released (Normal Touch Mode)");
-        notify_app_mode(0);
+        notify_app_event(CB_MODE_TOUCH);
     }
 }
 
@@ -349,7 +378,6 @@ static int open_touchscreen_device(void) {
         memset(name, 0, sizeof(name));
         ioctl(fd, EVIOCGNAME(sizeof(name) - 1), name);
 
-        /* Skip our own virtual mouse device */
         if (strstr(name, "Virtual Mobile Trackpad") != NULL ||
             strstr(name, "uinput") != NULL) {
             close(fd);
@@ -387,8 +415,6 @@ static int open_touchscreen_device(void) {
 
         close(fd);
     }
-
-    LOGE("Could not find physical multi-touch screen in /dev/input/event*");
     return -1;
 }
 
@@ -402,7 +428,6 @@ static int init_uinput(void) {
         return -1;
     }
 
-    /* Pure Original Hardware Mouse (EV_REL + BTN_LEFT/BTN_RIGHT/BTN_MIDDLE) */
     ioctl(fd, UI_SET_EVBIT, EV_REL);
     ioctl(fd, UI_SET_RELBIT, REL_X);
     ioctl(fd, UI_SET_RELBIT, REL_Y);
@@ -427,18 +452,15 @@ static int init_uinput(void) {
     uidev.id.version = 1;
 
     if (write(fd, &uidev, sizeof(uidev)) < 0) {
-        LOGE("Failed to write uinput_user_dev: %s", strerror(errno));
         close(fd);
         return -1;
     }
 
     if (ioctl(fd, UI_DEV_CREATE) < 0) {
-        LOGE("Failed to ioctl UI_DEV_CREATE: %s", strerror(errno));
         close(fd);
         return -1;
     }
 
-    LOGI("Original /dev/uinput hardware mouse created in kernel!");
     usleep(50000);
     emit_move_batched(fd, 2, 2);
     return fd;
@@ -473,7 +495,6 @@ static void map_raw_to_screen(int raw_x, int raw_y, int *out_x, int *out_y) {
     if (range_x <= 0) range_x = 1080;
     if (range_y <= 0) range_y = 2400;
 
-    /* Normalized 0.0 .. 1.0 in physical panel coordinates */
     float nx = (float)(raw_x - touch_min_x) / (float)range_x;
     float ny = (float)(raw_y - touch_min_y) / (float)range_y;
     if (nx < 0.0f) nx = 0.0f;
@@ -482,7 +503,7 @@ static void map_raw_to_screen(int raw_x, int raw_y, int *out_x, int *out_y) {
     if (ny > 1.0f) ny = 1.0f;
 
     switch (screen_rotation) {
-        case 1: /* ROTATION_90 (Landscape) */
+        case 1: /* ROTATION_90 */
             *out_x = (int)(ny * screen_w);
             *out_y = (int)((1.0f - nx) * screen_h);
             break;
@@ -490,11 +511,11 @@ static void map_raw_to_screen(int raw_x, int raw_y, int *out_x, int *out_y) {
             *out_x = (int)((1.0f - nx) * screen_w);
             *out_y = (int)((1.0f - ny) * screen_h);
             break;
-        case 3: /* ROTATION_270 (Reverse Landscape) */
+        case 3: /* ROTATION_270 */
             *out_x = (int)((1.0f - ny) * screen_w);
             *out_y = (int)(nx * screen_h);
             break;
-        default: /* ROTATION_0 (Portrait) */
+        default: /* ROTATION_0 */
             *out_x = (int)(nx * screen_w);
             *out_y = (int)(ny * screen_h);
             break;
@@ -502,22 +523,58 @@ static void map_raw_to_screen(int raw_x, int raw_y, int *out_x, int *out_y) {
 }
 
 static int classify_dock_zone(int sx, int sy) {
-    if (sx >= dock_left && sx <= dock_right && sy >= dock_top && sy <= dock_bottom) {
-        int width = dock_right - dock_left;
-        if (width <= 0) return ROLE_TRACKPAD;
-        int rel_x = sx - dock_left;
-        /* Left 35%: Left Click (L) | Middle 30%: Mode Toggle | Right 35%: Right Click (R) */
-        if (rel_x < (width * 35) / 100) {
-            return ROLE_BTN_L;
-        } else if (rel_x > (width * 65) / 100) {
-            return ROLE_BTN_R;
-        } else {
-            return ROLE_BTN_MODE;
+    if (dock_right > dock_left && dock_bottom > dock_top) {
+        if (sx >= dock_left && sx <= dock_right && sy >= dock_top && sy <= dock_bottom) {
+            int width = dock_right - dock_left;
+            int rel_x = sx - dock_left;
+            /* 4 zones on floating dock:
+             * [0%..28%]: Left Click (L)
+             * [28%..56%]: Mode Toggle (MODE)
+             * [56%..82%]: Right Click (R)
+             * [82%..100%]: Hide Overlay Button (X)
+             */
+            if (rel_x < (width * 28) / 100) {
+                return ROLE_BTN_L;
+            } else if (rel_x < (width * 56) / 100) {
+                return ROLE_BTN_MODE;
+            } else if (rel_x < (width * 82) / 100) {
+                return ROLE_BTN_R;
+            } else {
+                return ROLE_BTN_HIDE;
+            }
         }
     }
     return ROLE_TRACKPAD;
 }
 
+static inline int dist_sq(int x1, int y1, int x2, int y2) {
+    int dx = x1 - x2;
+    int dy = y1 - y2;
+    return dx * dx + dy * dy;
+}
+
+static void emit_scaled_move(int raw_dx, int raw_dy) {
+    if (raw_dx == 0 && raw_dy == 0) return;
+    float vel = sqrtf((float)(raw_dx * raw_dx + raw_dy * raw_dy));
+    float accel = 1.0f + (vel * 0.025f);
+    if (accel > 2.4f) accel = 2.4f;
+
+    rem_dx += (float)raw_dx * pointer_sens * accel;
+    rem_dy += (float)raw_dy * pointer_sens * accel;
+
+    int out_dx = (int)rem_dx;
+    int out_dy = (int)rem_dy;
+    if (out_dx != 0 || out_dy != 0) {
+        rem_dx -= (float)out_dx;
+        rem_dy -= (float)out_dy;
+        emit_move_batched(uinput_fd, out_dx, out_dy);
+    }
+}
+
+/*
+ * Runs on every SYN_REPORT in BOTH Trackpad Mode (is_grabbed=1) AND Touch Mode (is_grabbed=0)
+ * so 3-finger tap can toggle modes bi-directionally!
+ */
 static void process_touch_frame_syn(void) {
     int64_t now = now_ms();
     int active_trackpad_slots[MAX_SLOTS];
@@ -540,107 +597,177 @@ static void process_touch_frame_syn(void) {
             s->down_time_ms = now;
             s->moved_beyond_tap = 0;
             s->drag_locked = 0;
-            s->role = classify_dock_zone(s->screen_x, s->screen_y);
 
-            if (s->role == ROLE_BTN_L) {
-                emit_single_with_syn(uinput_fd, EV_KEY, BTN_LEFT, 1);
-            } else if (s->role == ROLE_BTN_R) {
-                emit_single_with_syn(uinput_fd, EV_KEY, BTN_RIGHT, 1);
-            } else if (s->role == ROLE_BTN_MODE) {
-                pending_ungrab_on_release = 1;
+            if (is_grabbed) {
+                s->role = classify_dock_zone(s->screen_x, s->screen_y);
+                if (s->role == ROLE_BTN_L) {
+                    emit_single_with_syn(uinput_fd, EV_KEY, BTN_LEFT, 1);
+                } else if (s->role == ROLE_BTN_R) {
+                    emit_single_with_syn(uinput_fd, EV_KEY, BTN_RIGHT, 1);
+                } else if (s->role == ROLE_BTN_MODE) {
+                    pending_mode_swap = 1;
+                } else if (s->role == ROLE_BTN_HIDE) {
+                    pending_hide_overlay = 1;
+                }
+            } else {
+                s->role = ROLE_TRACKPAD;
             }
         }
 
         if (s->active && !s->just_up) {
             total_active_fingers++;
+            if (dist_sq(s->screen_x, s->screen_y, s->down_x, s->down_y) > (55 * 55)) {
+                gesture_moved_too_far = 1;
+            }
             if (s->role == ROLE_TRACKPAD) {
                 active_trackpad_slots[active_trackpad_count++] = i;
             }
         }
     }
 
-    if (active_trackpad_count >= 3) {
-        pending_ungrab_on_release = 1;
-    } else if (active_trackpad_count == 2) {
-        struct touch_slot *s0 = &slots[active_trackpad_slots[0]];
-        struct touch_slot *s1 = &slots[active_trackpad_slots[1]];
-        int mid_x = (s0->screen_x + s1->screen_x) / 2;
-        int mid_y = (s0->screen_y + s1->screen_y) / 2;
+    /* Track multi-finger gesture peak count for 3-Finger Tap detection */
+    if (total_active_fingers > 0) {
+        if (gesture_max_fingers == 0) {
+            gesture_start_ms = now;
+            gesture_moved_too_far = 0;
+        }
+        if (total_active_fingers > gesture_max_fingers) {
+            gesture_max_fingers = total_active_fingers;
+        }
+    }
 
-        if (!two_finger_session) {
-            two_finger_session = 1;
-            last_mid_x = mid_x;
-            last_mid_y = mid_y;
-            rem_scroll_x = 0.0f;
-            rem_scroll_y = 0.0f;
-        } else {
-            int dy = mid_y - last_mid_y;
-            int dx = mid_x - last_mid_x;
-            last_mid_x = mid_x;
-            last_mid_y = mid_y;
-
-            if (abs(dy) > 2 || abs(dx) > 2) {
-                s0->moved_beyond_tap = 1;
-                s1->moved_beyond_tap = 1;
-            }
-
-            rem_scroll_y += (float)dy * scroll_sens * 0.18f;
-            rem_scroll_x += (float)dx * scroll_sens * 0.18f;
-
-            int sy = (int)rem_scroll_y;
-            int sx = (int)rem_scroll_x;
-            if (sy != 0) {
-                rem_scroll_y -= (float)sy;
-                emit_single_with_syn(uinput_fd, EV_REL, REL_WHEEL, sy);
-            }
-            if (sx != 0) {
-                rem_scroll_x -= (float)sx;
-                emit_single_with_syn(uinput_fd, EV_REL, REL_HWHEEL, sx);
+    /* If we are in Normal Touch mode (is_grabbed == 0), only watch for 3-Finger Tap! */
+    if (!is_grabbed) {
+        for (int i = 0; i < MAX_SLOTS; i++) {
+            if (slots[i].just_up) {
+                slots[i].just_up = 0;
+                slots[i].active = 0;
+                slots[i].role = ROLE_NONE;
             }
         }
-        /* Keep prev_x/prev_y synced so lifting 1 finger doesn't jump cursor */
-        s0->prev_x = s0->screen_x;
-        s0->prev_y = s0->screen_y;
-        s1->prev_x = s1->screen_x;
-        s1->prev_y = s1->screen_y;
-    } else if (active_trackpad_count == 1 && !two_finger_session) {
-        struct touch_slot *s = &slots[active_trackpad_slots[0]];
+        if (total_active_fingers == 0 && gesture_max_fingers > 0) {
+            int64_t gesture_dur = now - gesture_start_ms;
+            if (three_finger_tap_enabled && gesture_max_fingers == 3 &&
+                !gesture_moved_too_far && gesture_dur < 420) {
+                /* 3-Finger Tap in Touch Mode -> Switch to Trackpad Mode! */
+                gesture_max_fingers = 0;
+                set_touch_grab(1);
+                return;
+            }
+            gesture_max_fingers = 0;
+        }
+        return;
+    }
+
+    /* ========================================================================
+     * Below runs ONLY when is_grabbed == 1 (Trackpad Mode)
+     * ======================================================================== */
+    if (active_trackpad_count == 2 && gesture_max_fingers < 3) {
+        int idx0 = active_trackpad_slots[0];
+        int idx1 = active_trackpad_slots[1];
+        struct touch_slot *s0 = &slots[idx0];
+        struct touch_slot *s1 = &slots[idx1];
+
+        /* Order so first_finger is the one that touched down earlier */
+        struct touch_slot *first_f = (s0->down_time_ms <= s1->down_time_ms) ? s0 : s1;
+        struct touch_slot *second_f = (s0->down_time_ms <= s1->down_time_ms) ? s1 : s0;
+        int first_idx = (s0->down_time_ms <= s1->down_time_ms) ? idx0 : idx1;
+
+        int first_moved_sq = dist_sq(first_f->screen_x, first_f->screen_y, first_f->down_x, first_f->down_y);
+        int second_moved_sq = dist_sq(second_f->screen_x, second_f->screen_y, second_f->down_x, second_f->down_y);
+
+        /*
+         * GESTURE 1: One-Finger Touch & Hold + Second-Finger Drag!
+         * Triggered when:
+         * - First finger is held stationary (moved < 30px from its down point)
+         * - AND either Hold-and-Drag is already active, OR second finger moves (> 12px) while first finger stays still
+         */
+        if (hold_and_drag_mode || (!two_finger_scroll_mode && first_moved_sq < (30 * 30) && second_moved_sq > (12 * 12))) {
+            if (!hold_and_drag_mode) {
+                hold_and_drag_mode = 1;
+                hold_anchor_slot = first_idx;
+                first_f->moved_beyond_tap = 1;
+                second_f->moved_beyond_tap = 1;
+                emit_single_with_syn(uinput_fd, EV_KEY, BTN_LEFT, 1);
+            }
+
+            /* Move cursor according to the dragging finger! */
+            struct touch_slot *mover = (hold_anchor_slot == idx0) ? s1 : s0;
+            int raw_dx = mover->screen_x - mover->prev_x;
+            int raw_dy = mover->screen_y - mover->prev_y;
+            s0->prev_x = s0->screen_x;
+            s0->prev_y = s0->screen_y;
+            s1->prev_x = s1->screen_x;
+            s1->prev_y = s1->screen_y;
+
+            emit_scaled_move(raw_dx, raw_dy);
+        } else if (!hold_and_drag_mode) {
+            /* Standard 2-Finger Scroll when both fingers move together */
+            int mid_x = (s0->screen_x + s1->screen_x) / 2;
+            int mid_y = (s0->screen_y + s1->screen_y) / 2;
+
+            if (!two_finger_scroll_mode) {
+                if (first_moved_sq > (22 * 22) && second_moved_sq > (22 * 22)) {
+                    two_finger_scroll_mode = 1;
+                    last_mid_x = mid_x;
+                    last_mid_y = mid_y;
+                    rem_scroll_x = 0.0f;
+                    rem_scroll_y = 0.0f;
+                    s0->moved_beyond_tap = 1;
+                    s1->moved_beyond_tap = 1;
+                }
+            } else {
+                int dy = mid_y - last_mid_y;
+                int dx = mid_x - last_mid_x;
+                last_mid_x = mid_x;
+                last_mid_y = mid_y;
+
+                rem_scroll_y += (float)dy * scroll_sens * 0.18f;
+                rem_scroll_x += (float)dx * scroll_sens * 0.18f;
+
+                int sy = (int)rem_scroll_y;
+                int sx = (int)rem_scroll_x;
+                if (sy != 0) {
+                    rem_scroll_y -= (float)sy;
+                    emit_single_with_syn(uinput_fd, EV_REL, REL_WHEEL, sy);
+                }
+                if (sx != 0) {
+                    rem_scroll_x -= (float)sx;
+                    emit_single_with_syn(uinput_fd, EV_REL, REL_HWHEEL, sx);
+                }
+            }
+            s0->prev_x = s0->screen_x;
+            s0->prev_y = s0->screen_y;
+            s1->prev_x = s1->screen_x;
+            s1->prev_y = s1->screen_y;
+        }
+    } else if (active_trackpad_count == 1 && gesture_max_fingers < 3 && !two_finger_scroll_mode) {
+        int idx = active_trackpad_slots[0];
+        struct touch_slot *s = &slots[idx];
         int raw_dx = s->screen_x - s->prev_x;
         int raw_dy = s->screen_y - s->prev_y;
         s->prev_x = s->screen_x;
         s->prev_y = s->screen_y;
 
-        int dist_from_down_sq = (s->screen_x - s->down_x) * (s->screen_x - s->down_x) +
-                                (s->screen_y - s->down_y) * (s->screen_y - s->down_y);
-
-        if (dist_from_down_sq > (24 * 24)) {
-            s->moved_beyond_tap = 1;
-        } else if (!s->moved_beyond_tap && !s->drag_locked && (now - s->down_time_ms) >= 420) {
-            /* Long-press without moving -> lock left click for drag! */
-            s->drag_locked = 1;
-            emit_single_with_syn(uinput_fd, EV_KEY, BTN_LEFT, 1);
-        }
-
-        if (raw_dx != 0 || raw_dy != 0) {
-            /* Smooth velocity-assisted trackpad curve */
-            float vel = sqrtf((float)(raw_dx * raw_dx + raw_dy * raw_dy));
-            float accel = 1.0f + (vel * 0.025f);
-            if (accel > 2.4f) accel = 2.4f;
-
-            rem_dx += (float)raw_dx * pointer_sens * accel;
-            rem_dy += (float)raw_dy * pointer_sens * accel;
-
-            int out_dx = (int)rem_dx;
-            int out_dy = (int)rem_dy;
-            if (out_dx != 0 || out_dy != 0) {
-                rem_dx -= (float)out_dx;
-                rem_dy -= (float)out_dy;
-                emit_move_batched(uinput_fd, out_dx, out_dy);
+        if (hold_and_drag_mode) {
+            /* If user lifted the 2nd dragging finger while still holding anchor finger, keep BTN_LEFT held! */
+            if (idx != hold_anchor_slot) {
+                emit_scaled_move(raw_dx, raw_dy);
             }
+        } else {
+            int dist_from_down_sq = dist_sq(s->screen_x, s->screen_y, s->down_x, s->down_y);
+            if (dist_from_down_sq > (24 * 24)) {
+                s->moved_beyond_tap = 1;
+            } else if (!s->moved_beyond_tap && !s->drag_locked && (now - s->down_time_ms) >= 420) {
+                s->drag_locked = 1;
+                emit_single_with_syn(uinput_fd, EV_KEY, BTN_LEFT, 1);
+            }
+
+            emit_scaled_move(raw_dx, raw_dy);
         }
     }
 
-    /* Handle finger releases */
+    /* Handle finger releases in Trackpad Mode */
     for (int i = 0; i < MAX_SLOTS; i++) {
         struct touch_slot *s = &slots[i];
         if (s->just_up) {
@@ -653,22 +780,20 @@ static void process_touch_frame_syn(void) {
             } else if (s->role == ROLE_BTN_R) {
                 emit_single_with_syn(uinput_fd, EV_KEY, BTN_RIGHT, 0);
             } else if (s->role == ROLE_TRACKPAD) {
-                if (s->drag_locked) {
+                if (hold_and_drag_mode && i == hold_anchor_slot) {
+                    /* Anchor finger lifted -> end Hold-and-Drag */
+                    hold_and_drag_mode = 0;
+                    hold_anchor_slot = -1;
+                    emit_single_with_syn(uinput_fd, EV_KEY, BTN_LEFT, 0);
+                } else if (s->drag_locked) {
                     s->drag_locked = 0;
                     emit_single_with_syn(uinput_fd, EV_KEY, BTN_LEFT, 0);
-                } else if (!s->moved_beyond_tap && duration < 220) {
-                    if (two_finger_session) {
-                        /* 2-finger tap -> Right Click */
-                        emit_single_with_syn(uinput_fd, EV_KEY, BTN_RIGHT, 1);
-                        usleep(12000);
-                        emit_single_with_syn(uinput_fd, EV_KEY, BTN_RIGHT, 0);
-                        two_finger_session = 0;
-                    } else {
-                        /* 1-finger tap -> Left Click */
-                        emit_single_with_syn(uinput_fd, EV_KEY, BTN_LEFT, 1);
-                        usleep(12000);
-                        emit_single_with_syn(uinput_fd, EV_KEY, BTN_LEFT, 0);
-                    }
+                } else if (!hold_and_drag_mode && !two_finger_scroll_mode &&
+                           gesture_max_fingers == 1 && !s->moved_beyond_tap && duration < 220) {
+                    /* 1-Finger Tap -> Left Click */
+                    emit_single_with_syn(uinput_fd, EV_KEY, BTN_LEFT, 1);
+                    usleep(12000);
+                    emit_single_with_syn(uinput_fd, EV_KEY, BTN_LEFT, 0);
                 }
             }
             s->role = ROLE_NONE;
@@ -676,9 +801,37 @@ static void process_touch_frame_syn(void) {
     }
 
     if (total_active_fingers == 0) {
-        two_finger_session = 0;
-        if (pending_ungrab_on_release) {
-            pending_ungrab_on_release = 0;
+        int64_t gesture_dur = now - gesture_start_ms;
+
+        if (hold_and_drag_mode) {
+            hold_and_drag_mode = 0;
+            hold_anchor_slot = -1;
+            emit_single_with_syn(uinput_fd, EV_KEY, BTN_LEFT, 0);
+        }
+
+        if (gesture_max_fingers == 2 && !two_finger_scroll_mode &&
+            !gesture_moved_too_far && gesture_dur < 260) {
+            /* 2-Finger Tap -> Right Click */
+            emit_single_with_syn(uinput_fd, EV_KEY, BTN_RIGHT, 1);
+            usleep(12000);
+            emit_single_with_syn(uinput_fd, EV_KEY, BTN_RIGHT, 0);
+        } else if (three_finger_tap_enabled && gesture_max_fingers == 3 &&
+                   !gesture_moved_too_far && gesture_dur < 420) {
+            /* 3-Finger Tap in Trackpad Mode -> Swap to Touch Mode! */
+            pending_mode_swap = 1;
+        }
+
+        two_finger_scroll_mode = 0;
+        gesture_max_fingers = 0;
+
+        if (pending_hide_overlay) {
+            pending_hide_overlay = 0;
+            dock_left = dock_top = dock_right = dock_bottom = 0;
+            notify_app_event(CB_HIDE_OVERLAY);
+        }
+
+        if (pending_mode_swap) {
+            pending_mode_swap = 0;
             set_touch_grab(0);
         }
     }
@@ -717,7 +870,6 @@ static void handle_touch_events(void) {
                 slots[current_slot].raw_y = val;
             }
         } else if (type == EV_KEY && code == BTN_TOUCH) {
-            /* Single-touch fallback if device doesn't send ABS_MT_TRACKING_ID */
             if (val == 1 && !slots[current_slot].active) {
                 slots[current_slot].active = 1;
                 slots[current_slot].just_down = 1;
@@ -725,9 +877,7 @@ static void handle_touch_events(void) {
                 slots[current_slot].just_up = 1;
             }
         } else if (type == EV_SYN && code == SYN_REPORT) {
-            if (is_grabbed) {
-                process_touch_frame_syn();
-            }
+            process_touch_frame_syn();
         }
     }
 }
@@ -764,19 +914,19 @@ static void handle_udp_packet(
             set_touch_grab(pkt->arg1);
             break;
         case CMD_SET_CONFIG:
-            /* arg1 = sens * 100, arg2 = scroll_sens * 100, arg3 = screen_w, arg4 = screen_h | (rot << 16) */
+            /* arg1 = sens * 100, arg2 = scroll_sens * 100, arg3 = screen_w, arg4 = screen_h | (rot << 16) | (three_finger << 20) */
             if (pkt->arg1 > 0) pointer_sens = (float)pkt->arg1 / 100.0f;
             if (pkt->arg2 > 0) scroll_sens = (float)pkt->arg2 / 100.0f;
             if (pkt->arg3 > 0) screen_w = pkt->arg3;
             if ((pkt->arg4 & 0xFFFF) > 0) screen_h = (pkt->arg4 & 0xFFFF);
             screen_rotation = (pkt->arg4 >> 16) & 0x3;
+            three_finger_tap_enabled = ((pkt->arg4 >> 20) & 0x1) ? 1 : 0;
             break;
         case CMD_SET_DOCK:
             dock_left = pkt->arg1;
             dock_top = pkt->arg2;
             dock_right = pkt->arg3;
             dock_bottom = pkt->arg4;
-            LOGI("Updated dock bounds: [%d, %d, %d, %d]", dock_left, dock_top, dock_right, dock_bottom);
             break;
         case CMD_PING:
             if (client_addr != NULL && client_len > 0) {
@@ -811,6 +961,7 @@ int main(int argc, char *argv[]) {
     if (uinput_fd < 0) return 1;
 
     touch_fd = open_touchscreen_device();
+    sync_slot_state_from_kernel();
 
     sock_fd = init_fast_socket();
     if (sock_fd < 0) {
@@ -842,12 +993,10 @@ int main(int argc, char *argv[]) {
         }
         if (ret == 0) continue;
 
-        /* 1. Process raw kernel touchscreen events */
         if (nfds == 2 && (pfds[1].revents & POLLIN)) {
             handle_touch_events();
         }
 
-        /* 2. Process UDP control/IPC packets from the Android app */
         if (pfds[0].revents & POLLIN) {
             struct vmouse_packet pkt;
             struct sockaddr_in client_addr;

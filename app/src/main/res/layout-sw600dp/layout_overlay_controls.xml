@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="wrap_content"
+    android:layout_height="wrap_content"
+    android:orientation="horizontal"
+    android:background="@drawable/bg_floating_pill"
+    android:padding="10dp"
+    android:gravity="center_vertical">
+
+    <!-- Drag Handle -->
+    <View
+        android:id="@+id/drag_handle"
+        android:layout_width="16dp"
+        android:layout_height="36dp"
+        android:layout_marginStart="4dp"
+        android:layout_marginEnd="10dp"
+        android:background="#64748B" />
+
+    <!-- Left Click Button -->
+    <Button
+        android:id="@+id/btn_left_click"
+        android:layout_width="82dp"
+        android:layout_height="52dp"
+        android:text="LEFT"
+        android:textSize="13sp"
+        android:textStyle="bold"
+        android:textColor="#FFFFFF"
+        android:backgroundTint="#3B82F6"
+        android:insetTop="0dp"
+        android:insetBottom="0dp"
+        android:layout_marginEnd="8dp" />
+
+    <!-- Mode Toggle Button -->
+    <LinearLayout
+        android:id="@+id/btn_toggle_mode"
+        android:layout_width="104dp"
+        android:layout_height="52dp"
+        android:orientation="vertical"
+        android:gravity="center"
+        android:background="@drawable/bg_floating_button"
+        android:clickable="true"
+        android:focusable="true">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="INPUT MODE"
+            android:textSize="9sp"
+            android:textColor="#94A3B8" />
+
+        <TextView
+            android:id="@+id/tv_mode_status"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="TRACKPAD"
+            android:textStyle="bold"
+            android:textSize="13sp"
+            android:textColor="#10B981" />
+    </LinearLayout>
+
+    <!-- Right Click Button -->
+    <Button
+        android:id="@+id/btn_right_click"
+        android:layout_width="82dp"
+        android:layout_height="52dp"
+        android:text="RIGHT"
+        android:textSize="13sp"
+        android:textStyle="bold"
+        android:textColor="#FFFFFF"
+        android:backgroundTint="#6366F1"
+        android:insetTop="0dp"
+        android:insetBottom="0dp"
+        android:layout_marginStart="8dp" />
+
+    <!-- Hide Overlay Button -->
+    <TextView
+        android:id="@+id/btn_hide_dock"
+        android:layout_width="52dp"
+        android:layout_height="52dp"
+        android:layout_marginStart="8dp"
+        android:gravity="center"
+        android:background="@drawable/bg_floating_button"
+        android:text="✕"
+        android:textColor="#94A3B8"
+        android:textSize="16sp"
+        android:textStyle="bold"
+        android:clickable="true"
+        android:focusable="true" />
+
+</LinearLayout>

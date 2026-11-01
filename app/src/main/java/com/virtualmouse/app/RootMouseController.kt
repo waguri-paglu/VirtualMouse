@@ -16,7 +16,7 @@ import java.util.zip.ZipFile
 
 /**
  * Manages the root uinput + EVIOCGRAB kernel daemon and syncs screen config,
- * floating dock button coordinates, and Trackpad/Touch grab states.
+ * floating dock button coordinates, and Trackpad/Touch/Hide states.
  */
 object RootMouseController {
     private const val TAG = "RootMouseController"
@@ -60,7 +60,7 @@ object RootMouseController {
     private val executor = Executors.newCachedThreadPool()
 
     var onStateChanged: ((DriverState, String) -> Unit)? = null
-    var onGrabModeChangedFromDaemon: ((Boolean) -> Unit)? = null
+    var onDaemonEvent: ((Int) -> Unit)? = null
 
     fun isRootAvailable(): Boolean {
         return try {
@@ -162,8 +162,8 @@ object RootMouseController {
                 while (isRunning && !sock.isClosed) {
                     sock.receive(pkt)
                     if (pkt.length == 4) {
-                        val grabbed = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN).int == 1
-                        onGrabModeChangedFromDaemon?.invoke(grabbed)
+                        val eventCode = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN).int
+                        onDaemonEvent?.invoke(eventCode)
                     }
                 }
             } catch (ignored: Exception) {}
@@ -203,12 +203,20 @@ object RootMouseController {
         nativeSendPacket(CMD_SET_GRAB, if (enable) 1 else 0, 0, 0, 0)
     }
 
-    fun updateConfig(sens: Float, scrollSens: Float, screenW: Int, screenH: Int, rotation: Int) {
+    fun updateConfig(
+        sens: Float,
+        scrollSens: Float,
+        screenW: Int,
+        screenH: Int,
+        rotation: Int,
+        threeFingerTap: Boolean = true
+    ) {
         if (!isRunning) return
         val s1 = (sens * 100f).toInt()
         val s2 = (scrollSens * 100f).toInt()
-        val packedHAndRot = (screenH and 0xFFFF) or ((rotation and 0x3) shl 16)
-        nativeSendPacket(CMD_SET_CONFIG, s1, s2, screenW, packedHAndRot)
+        val tfFlag = if (threeFingerTap) 1 else 0
+        val packedHAndFlags = (screenH and 0xFFFF) or ((rotation and 0x3) shl 16) or (tfFlag shl 20)
+        nativeSendPacket(CMD_SET_CONFIG, s1, s2, screenW, packedHAndFlags)
     }
 
     fun updateDockBounds(left: Int, top: Int, right: Int, bottom: Int) {
@@ -271,7 +279,6 @@ object RootMouseController {
                 p.outputStream.write(suCmd.toByteArray())
                 p.outputStream.flush()
                 p.waitFor()
-                Log.i(TAG, "Successfully deployed binary to $TARGET_DAEMON_PATH from $sourcePath")
                 return TARGET_DAEMON_PATH
             }
         } catch (e: Exception) {

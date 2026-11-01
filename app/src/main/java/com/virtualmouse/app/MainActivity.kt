@@ -1,7 +1,7 @@
 package com.virtualmouse.app
 
 import android.content.Intent
-import android.content.res.Configuration
+import android.content.SharedPreferences
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -11,24 +11,32 @@ import android.widget.SeekBar
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.preference.PreferenceManager
+import com.google.android.material.color.DynamicColors
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.virtualmouse.app.databinding.ActivityMainBinding
 
-class MainActivity : AppCompatActivity() {
+class MainActivity : AppCompatActivity(), SharedPreferences.OnSharedPreferenceChangeListener {
 
     private lateinit var binding: ActivityMainBinding
+    private lateinit var prefs: SharedPreferences
     private var isServiceActive = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        // Apply Google Pixel Monet Dynamic Wallpaper Colors (Android 12+)
+        DynamicColors.applyToActivityIfAvailable(this)
         super.onCreate(savedInstanceState)
+
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
-        val prefs = PreferenceManager.getDefaultSharedPreferences(this)
+        prefs = PreferenceManager.getDefaultSharedPreferences(this)
+        prefs.registerOnSharedPreferenceChangeListener(this)
 
+        setupBottomNavigation()
         setupListeners()
-        setupCalibrationSliders(prefs)
+        setupCalibrationSliders()
         setupPresetChips()
+        setupPreferenceSwitches()
 
         RootMouseController.onStateChanged = { state, message ->
             runOnUiThread {
@@ -37,11 +45,82 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    override fun onDestroy() {
+        super.onDestroy()
+        prefs.unregisterOnSharedPreferenceChangeListener(this)
+    }
+
     override fun onResume() {
         super.onResume()
         updateRootStatus()
         updateOverlayStatus()
         syncServiceState()
+        syncSwitchesFromPrefs()
+    }
+
+    override fun onSharedPreferenceChanged(sharedPreferences: SharedPreferences?, key: String?) {
+        if (key == "show_dock") {
+            runOnUiThread { syncSwitchesFromPrefs() }
+        }
+    }
+
+    private fun setupBottomNavigation() {
+        binding.bottomNav.setOnItemSelectedListener { item ->
+            when (item.itemId) {
+                R.id.nav_home -> {
+                    binding.pageHome.visibility = View.VISIBLE
+                    binding.pageSettings.visibility = View.GONE
+                    binding.tvPageTitle.text = "Virtual Mouse"
+                    true
+                }
+                R.id.nav_settings -> {
+                    binding.pageHome.visibility = View.GONE
+                    binding.pageSettings.visibility = View.VISIBLE
+                    binding.tvPageTitle.text = "Settings"
+                    true
+                }
+                else -> false
+            }
+        }
+    }
+
+    private fun setupPreferenceSwitches() {
+        syncSwitchesFromPrefs()
+
+        binding.switchHomeShowDock.setOnCheckedChangeListener { _, isChecked ->
+            if (prefs.getBoolean("show_dock", true) != isChecked) {
+                prefs.edit().putBoolean("show_dock", isChecked).apply()
+            }
+            binding.switchShowDock.isChecked = isChecked
+        }
+
+        binding.switchShowDock.setOnCheckedChangeListener { _, isChecked ->
+            if (prefs.getBoolean("show_dock", true) != isChecked) {
+                prefs.edit().putBoolean("show_dock", isChecked).apply()
+            }
+            binding.switchHomeShowDock.isChecked = isChecked
+        }
+
+        binding.switchAutoIme.setOnCheckedChangeListener { _, isChecked ->
+            prefs.edit().putBoolean("auto_ime_switch", isChecked).apply()
+        }
+
+        binding.switchThreeFinger.setOnCheckedChangeListener { _, isChecked ->
+            prefs.edit().putBoolean("three_finger_tap", isChecked).apply()
+        }
+
+        binding.switchHaptics.setOnCheckedChangeListener { _, isChecked ->
+            prefs.edit().putBoolean("haptics_enabled", isChecked).apply()
+        }
+    }
+
+    private fun syncSwitchesFromPrefs() {
+        val showDock = prefs.getBoolean("show_dock", true)
+        binding.switchHomeShowDock.isChecked = showDock
+        binding.switchShowDock.isChecked = showDock
+        binding.switchAutoIme.isChecked = prefs.getBoolean("auto_ime_switch", true)
+        binding.switchThreeFinger.isChecked = prefs.getBoolean("three_finger_tap", true)
+        binding.switchHaptics.isChecked = prefs.getBoolean("haptics_enabled", true)
     }
 
     private fun setupListeners() {
@@ -91,7 +170,7 @@ class MainActivity : AppCompatActivity() {
                     }
                     isServiceActive = true
                     updateUiActiveState(true)
-                    Toast.makeText(this, "Virtual Mouse Active! Cursor visible.", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this, "Virtual Mouse v1.2 Active!", Toast.LENGTH_SHORT).show()
                 } else {
                     updateUiActiveState(false)
                     MaterialAlertDialogBuilder(this)
@@ -124,7 +203,7 @@ class MainActivity : AppCompatActivity() {
             binding.tvLaunchStatus.visibility = View.VISIBLE
             binding.tvLaunchStatus.text = message
             binding.btnStartStop.isEnabled = false
-            binding.btnStartStop.text = "Initializing Driver..."
+            binding.btnStartStop.text = "Initializing..."
         } else {
             binding.progressBarLaunch.visibility = View.GONE
             binding.btnStartStop.isEnabled = true
@@ -142,7 +221,7 @@ class MainActivity : AppCompatActivity() {
             }
             RootMouseController.DriverState.RUNNING -> {
                 binding.progressBarLaunch.visibility = View.GONE
-                binding.tvLaunchStatus.text = "Virtual mouse driver running"
+                binding.tvLaunchStatus.text = "Virtual mouse active"
                 isServiceActive = true
                 updateUiActiveState(true)
             }
@@ -162,22 +241,18 @@ class MainActivity : AppCompatActivity() {
     private fun updateUiActiveState(active: Boolean) {
         if (active) {
             binding.btnStartStop.text = "Stop Virtual Mouse"
-            binding.btnStartStop.setBackgroundColor(0xFFEF4444.toInt())
             binding.chipServiceStatus.text = "RUNNING"
-            binding.chipServiceStatus.setChipBackgroundColorResource(android.R.color.holo_green_dark)
-            binding.tvLaunchStatus.text = "Virtual mouse hardware pointer active"
+            binding.tvLaunchStatus.text = "Hardware pointer & trackpad active"
         } else {
             binding.btnStartStop.text = "Start Virtual Mouse"
-            binding.btnStartStop.setBackgroundColor(0xFF10B981.toInt())
             binding.chipServiceStatus.text = "STANDBY"
-            binding.chipServiceStatus.setChipBackgroundColorResource(android.R.color.darker_gray)
             binding.tvLaunchStatus.text = "Ready to launch"
         }
     }
 
-    private fun setupCalibrationSliders(prefs: android.content.SharedPreferences) {
+    private fun setupCalibrationSliders() {
         val isTablet = resources.configuration.smallestScreenWidthDp >= 600
-        val defaultSens = if (isTablet) 1.6f else 1.3f
+        val defaultSens = if (isTablet) 1.6f else 1.4f
 
         val currentSens = prefs.getFloat("sensitivity", defaultSens)
         binding.sbSensitivity.progress = (currentSens * 10).toInt()
@@ -209,38 +284,20 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setupPresetChips() {
-        binding.chipSensSlow.setOnClickListener {
-            binding.sbSensitivity.progress = 8
-        }
-        binding.chipSensNormal.setOnClickListener {
-            binding.sbSensitivity.progress = 13
-        }
-        binding.chipSensFast.setOnClickListener {
-            binding.sbSensitivity.progress = 20
-        }
+        binding.chipSensSlow.setOnClickListener { binding.sbSensitivity.progress = 8 }
+        binding.chipSensNormal.setOnClickListener { binding.sbSensitivity.progress = 14 }
+        binding.chipSensFast.setOnClickListener { binding.sbSensitivity.progress = 20 }
 
-        binding.chipScrollSmooth.setOnClickListener {
-            binding.sbScrollSensitivity.progress = 3
-        }
-        binding.chipScrollStandard.setOnClickListener {
-            binding.sbScrollSensitivity.progress = 5
-        }
-        binding.chipScrollSwift.setOnClickListener {
-            binding.sbScrollSensitivity.progress = 10
-        }
+        binding.chipScrollSmooth.setOnClickListener { binding.sbScrollSensitivity.progress = 3 }
+        binding.chipScrollStandard.setOnClickListener { binding.sbScrollSensitivity.progress = 5 }
+        binding.chipScrollSwift.setOnClickListener { binding.sbScrollSensitivity.progress = 10 }
     }
 
     private fun updateRootStatus() {
         Thread {
             val rootOk = RootMouseController.isRootAvailable()
             runOnUiThread {
-                if (rootOk) {
-                    binding.tvRootStatus.text = "GRANTED"
-                    binding.tvRootStatus.setTextColor(0xFF10B981.toInt())
-                } else {
-                    binding.tvRootStatus.text = "NOT FOUND"
-                    binding.tvRootStatus.setTextColor(0xFFEF4444.toInt())
-                }
+                binding.tvRootStatus.text = if (rootOk) "Granted" else "Denied"
             }
         }.start()
     }
@@ -253,23 +310,19 @@ class MainActivity : AppCompatActivity() {
         }
 
         if (hasOverlay) {
-            binding.tvOverlayStatus.text = "ENABLED"
-            binding.tvOverlayStatus.setTextColor(0xFF10B981.toInt())
+            binding.tvOverlayStatus.text = "Enabled"
             binding.btnGrantOverlay.visibility = View.GONE
         } else {
-            binding.tvOverlayStatus.text = "ACTION REQUIRED"
-            binding.tvOverlayStatus.setTextColor(0xFFF59E0B.toInt())
+            binding.tvOverlayStatus.text = "Missing"
             binding.btnGrantOverlay.visibility = View.VISIBLE
         }
     }
 
     private fun showInfoDialog() {
-        val isTablet = resources.configuration.smallestScreenWidthDp >= 600
-        val modeLabel = if (isTablet) "Tablet Multi-Column UI" else "Mobile Compact UI"
         MaterialAlertDialogBuilder(this)
-            .setTitle("Virtual Mouse ($modeLabel)")
-            .setMessage("Virtual Mouse turns your entire display into a low-latency hardware trackpad using the Linux /dev/uinput kernel subsystem.\n\n• Tap MODE on the floating dock to toggle between Trackpad and regular touchscreen touch at any time.\n• Drag the left handle on the dock to position it anywhere on your screen.")
-            .setPositiveButton("Got it", null)
+            .setTitle("Virtual Mouse v1.2.0")
+            .setMessage("• 1-Finger Hold + 2nd-Finger Drag: Hold 1 finger stationary and drag with a 2nd finger to hold Left Click and drag items/text.\n• 3-Finger Tap: Instantly swap between Trackpad and Touch mode anytime.\n• Auto-Keyboard: Automatically switches to Touch mode when the keyboard opens, and restores Trackpad when done.\n• Hide Overlay: Tap ✕ on the dock or toggle in Home/Settings.")
+            .setPositiveButton("Close", null)
             .show()
     }
 }

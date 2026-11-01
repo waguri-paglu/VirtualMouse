@@ -10,6 +10,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.ServiceInfo
+import android.graphics.Color
 import android.graphics.PixelFormat
 import android.os.Build
 import android.os.Handler
@@ -23,27 +24,38 @@ import android.view.LayoutInflater
 import android.view.MotionEvent
 import android.view.Surface
 import android.view.View
+import android.view.WindowInsets
 import android.view.WindowManager
 import android.widget.TextView
+import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import androidx.preference.PreferenceManager
 
 /**
- * Foreground Service for the EVIOCGRAB + Original /dev/uinput Virtual Mouse.
- * Does NOT place any full-screen overlay over the screen, so all native /dev/uinput
- * left and right clicks hit underlying apps directly!
+ * Virtual Mouse v1.2.0 Foreground Service:
+ * - Hosts the floating controls dock (with Hide button)
+ * - Hosts a 1px invisible IME sensor window that automatically switches to Touch Mode
+ *   when the soft keyboard appears, and restores Trackpad Mode when the keyboard closes.
  */
 class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeListener {
 
     private lateinit var windowManager: WindowManager
     private lateinit var prefs: SharedPreferences
     private var controlsView: View? = null
+    private var imeSensorView: View? = null
     private lateinit var controlsLayoutParams: WindowManager.LayoutParams
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private var isTrackpadActive = true
+    private var pausedByKeyboard = false
+    private var isKeyboardVisible = false
+
     private var sensitivity: Float = 1.4f
     private var scrollSensitivity: Float = 0.5f
+    private var showFloatingDock: Boolean = true
+    private var autoKeyboardSwitch: Boolean = true
+    private var threeFingerTap: Boolean = true
+    private var hapticsEnabled: Boolean = true
 
     private var screenWidth: Int = 1080
     private var screenHeight: Int = 2400
@@ -53,6 +65,7 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
         const val CHANNEL_ID = "vmouse_service_channel"
         const val NOTIFICATION_ID = 1001
         const val ACTION_STOP = "com.virtualmouse.app.ACTION_STOP"
+        const val ACTION_TOGGLE_DOCK = "com.virtualmouse.app.ACTION_TOGGLE_DOCK"
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -63,8 +76,7 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
         updateScreenMetrics()
 
         prefs = PreferenceManager.getDefaultSharedPreferences(this)
-        sensitivity = prefs.getFloat("sensitivity", 1.4f)
-        scrollSensitivity = prefs.getFloat("scroll_sensitivity", 0.5f)
+        loadPreferences()
         prefs.registerOnSharedPreferenceChangeListener(this)
 
         createNotificationChannel()
@@ -78,17 +90,32 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
             startForeground(NOTIFICATION_ID, createNotification())
         }
 
-        RootMouseController.onGrabModeChangedFromDaemon = { grabbed ->
+        RootMouseController.onDaemonEvent = { eventCode ->
             mainHandler.post {
-                isTrackpadActive = grabbed
-                updateDockUiState(grabbed)
+                when (eventCode) {
+                    0 -> { // CB_MODE_TOUCH
+                        isTrackpadActive = false
+                        updateDockUiState(false)
+                    }
+                    1 -> { // CB_MODE_TRACKPAD
+                        isTrackpadActive = true
+                        updateDockUiState(true)
+                    }
+                    2 -> { // CB_HIDE_OVERLAY (Hide button tapped on dock while in Trackpad mode)
+                        prefs.edit().putBoolean("show_dock", false).apply()
+                        Toast.makeText(
+                            this,
+                            "Buttons hidden. 3-finger tap swaps mode; use notification or app to restore.",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    }
+                }
             }
         }
 
+        initImeSensorWindow()
         initFloatingControls()
 
-        // Ensure daemon is running, push config & dock bounds, and activate EVIOCGRAB after 180ms
-        // so the user's finger from tapping 'Start Virtual Mouse' has completely lifted!
         RootMouseController.startAsync(this) { success, _ ->
             if (!success) {
                 stopSelf()
@@ -99,6 +126,15 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
                 }, 180L)
             }
         }
+    }
+
+    private fun loadPreferences() {
+        sensitivity = prefs.getFloat("sensitivity", 1.4f)
+        scrollSensitivity = prefs.getFloat("scroll_sensitivity", 0.5f)
+        showFloatingDock = prefs.getBoolean("show_dock", true)
+        autoKeyboardSwitch = prefs.getBoolean("auto_ime_switch", true)
+        threeFingerTap = prefs.getBoolean("three_finger_tap", true)
+        hapticsEnabled = prefs.getBoolean("haptics_enabled", true)
     }
 
     private fun updateScreenMetrics() {
@@ -126,6 +162,92 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
         }
     }
 
+    /**
+     * Invisible 1px edge sensor window with FLAG_NOT_FOCUSABLE | FLAG_ALT_FOCUSABLE_IM
+     * and SOFT_INPUT_ADJUST_RESIZE so Android WindowManager notifies us immediately
+     * whenever the soft keyboard (IME) opens or closes in ANY app!
+     */
+    private fun initImeSensorWindow() {
+        val sensor = View(this).apply {
+            setBackgroundColor(Color.TRANSPARENT)
+        }
+
+        val layoutType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+        } else {
+            @Suppress("DEPRECATION")
+            WindowManager.LayoutParams.TYPE_PHONE
+        }
+
+        val params = WindowManager.LayoutParams(
+            1,
+            WindowManager.LayoutParams.MATCH_PARENT,
+            layoutType,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                    WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM,
+            PixelFormat.TRANSPARENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
+        }
+
+        sensor.setOnApplyWindowInsetsListener { v, insets ->
+            val imeVisible = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                insets.isVisible(WindowInsets.Type.ime()) ||
+                        insets.getInsets(WindowInsets.Type.ime()).bottom > (screenHeight * 0.12)
+            } else {
+                @Suppress("DEPRECATION")
+                insets.systemWindowInsetBottom > (screenHeight * 0.15)
+            }
+            handleKeyboardVisibilityChange(imeVisible)
+            v.onApplyWindowInsets(insets)
+        }
+
+        sensor.viewTreeObserver.addOnGlobalLayoutListener {
+            val h = sensor.height
+            if (h > 0 && screenHeight > 0) {
+                val shrunkByKeyboard = h < (screenHeight * 0.80)
+                handleKeyboardVisibilityChange(shrunkByKeyboard)
+            }
+        }
+
+        imeSensorView = sensor
+        try {
+            windowManager.addView(sensor, params)
+        } catch (ignored: Exception) {}
+    }
+
+    private fun handleKeyboardVisibilityChange(visible: Boolean) {
+        if (visible == isKeyboardVisible) return
+        isKeyboardVisible = visible
+
+        if (!autoKeyboardSwitch) return
+
+        if (visible) {
+            // Soft keyboard appeared -> automatically switch to Touch mode so user can type!
+            if (isTrackpadActive) {
+                pausedByKeyboard = true
+                isTrackpadActive = false
+                RootMouseController.setTouchGrab(false)
+                updateDockUiState(false, isKeyboardAuto = true)
+            }
+        } else {
+            // Soft keyboard closed -> automatically switch back to Trackpad mode!
+            if (pausedByKeyboard) {
+                pausedByKeyboard = false
+                mainHandler.postDelayed({
+                    if (!isKeyboardVisible) {
+                        isTrackpadActive = true
+                        syncDaemonConfigAndBounds()
+                        RootMouseController.setTouchGrab(true)
+                        updateDockUiState(true)
+                    }
+                }, 160L)
+            }
+        }
+    }
+
     private fun syncDaemonConfigAndBounds() {
         updateScreenMetrics()
         RootMouseController.updateConfig(
@@ -133,9 +255,13 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
             scrollSensitivity,
             screenWidth,
             screenHeight,
-            screenRotation
+            screenRotation,
+            threeFingerTap
         )
-        controlsView?.let { view ->
+        val view = controlsView
+        if (!showFloatingDock || view == null || view.visibility != View.VISIBLE) {
+            RootMouseController.updateDockBounds(0, 0, 0, 0)
+        } else {
             val loc = IntArray(2)
             view.getLocationOnScreen(loc)
             val left = loc[0]
@@ -155,16 +281,24 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
 
     override fun onSharedPreferenceChanged(sharedPreferences: SharedPreferences?, key: String?) {
         if (sharedPreferences == null) return
+        loadPreferences()
         when (key) {
-            "sensitivity" -> {
-                sensitivity = sharedPreferences.getFloat("sensitivity", 1.4f)
-                syncDaemonConfigAndBounds()
+            "show_dock" -> {
+                updateDockVisibility()
             }
-            "scroll_sensitivity" -> {
-                scrollSensitivity = sharedPreferences.getFloat("scroll_sensitivity", 0.5f)
+            "sensitivity", "scroll_sensitivity", "three_finger_tap" -> {
                 syncDaemonConfigAndBounds()
             }
         }
+    }
+
+    private fun updateDockVisibility() {
+        controlsView?.visibility = if (showFloatingDock) View.VISIBLE else View.GONE
+        controlsView?.post {
+            syncDaemonConfigAndBounds()
+        }
+        val nm = getSystemService(NotificationManager::class.java)
+        nm.notify(NOTIFICATION_ID, createNotification())
     }
 
     @SuppressLint("ClickableViewAccessibility", "InflateParams")
@@ -172,6 +306,7 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
         val themedContext = ContextThemeWrapper(this, R.style.Theme_VirtualMouse)
         val inflater = LayoutInflater.from(themedContext)
         controlsView = inflater.inflate(R.layout.layout_overlay_controls, null)
+        controlsView?.visibility = if (showFloatingDock) View.VISIBLE else View.GONE
 
         val layoutType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
@@ -195,13 +330,13 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
         val btnLeftClick = controlsView?.findViewById<View>(R.id.btn_left_click)
         val btnRightClick = controlsView?.findViewById<View>(R.id.btn_right_click)
         val btnToggle = controlsView?.findViewById<View>(R.id.btn_toggle_mode)
+        val btnHideDock = controlsView?.findViewById<View>(R.id.btn_hide_dock)
         val dragHandle = controlsView?.findViewById<View>(R.id.drag_handle)
 
-        // Works when clicked via the mouse cursor or in Normal Touch mode
         btnLeftClick?.setOnTouchListener { v, event ->
             when (event.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
-                    v.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+                    if (hapticsEnabled) v.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
                     RootMouseController.mouseDown(1)
                     true
                 }
@@ -214,18 +349,17 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
         }
 
         btnRightClick?.setOnClickListener { v ->
-            v.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+            if (hapticsEnabled) v.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
             RootMouseController.click(2)
         }
 
-        // Toggle Trackpad (EVIOCGRAB=1) vs Normal Touch (EVIOCGRAB=0)
         btnToggle?.setOnClickListener { v ->
-            v.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+            if (hapticsEnabled) v.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+            pausedByKeyboard = false
             val targetGrab = !isTrackpadActive
             isTrackpadActive = targetGrab
             updateDockUiState(targetGrab)
             if (targetGrab) {
-                // Delay 150ms so finger lift from tapping MODE completes before grabbing touchscreen
                 mainHandler.postDelayed({
                     syncDaemonConfigAndBounds()
                     RootMouseController.setTouchGrab(true)
@@ -233,6 +367,16 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
             } else {
                 RootMouseController.setTouchGrab(false)
             }
+        }
+
+        btnHideDock?.setOnClickListener { v ->
+            if (hapticsEnabled) v.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+            prefs.edit().putBoolean("show_dock", false).apply()
+            Toast.makeText(
+                this,
+                "Buttons hidden. 3-finger tap swaps mode; use notification or app to restore.",
+                Toast.LENGTH_SHORT
+            ).show()
         }
 
         dragHandle?.setOnTouchListener(object : View.OnTouchListener {
@@ -272,14 +416,16 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
         }
     }
 
-    private fun updateDockUiState(grabbed: Boolean) {
+    private fun updateDockUiState(grabbed: Boolean, isKeyboardAuto: Boolean = false) {
         val tvStatus = controlsView?.findViewById<TextView>(R.id.tv_mode_status)
-        controlsView?.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+        if (hapticsEnabled) {
+            controlsView?.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+        }
         if (grabbed) {
             tvStatus?.text = "TRACKPAD"
             tvStatus?.setTextColor(0xFF10B981.toInt())
         } else {
-            tvStatus?.text = "TOUCH"
+            tvStatus?.text = if (isKeyboardAuto) "TOUCH (KB)" else "TOUCH"
             tvStatus?.setTextColor(0xFF38BDF8.toInt())
         }
     }
@@ -305,6 +451,14 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
+        val toggleDockIntent = Intent(this, OverlayService::class.java).apply {
+            action = ACTION_TOGGLE_DOCK
+        }
+        val toggleDockPending = PendingIntent.getService(
+            this, 2, toggleDockIntent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
         val stopIntent = Intent(this, OverlayService::class.java).apply {
             action = ACTION_STOP
         }
@@ -313,20 +467,29 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
             PendingIntent.FLAG_IMMUTABLE
         )
 
+        val dockActionLabel = if (showFloatingDock) "Hide Buttons" else "Show Buttons"
+
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("Virtual Mouse Active (uinput + EVIOCGRAB)")
-            .setContentText("Tap MODE on dock to switch between Trackpad and Touch.")
+            .setContentTitle("Virtual Mouse v1.2 Active")
+            .setContentText("3-finger tap swaps mode • Auto-keyboard touch enabled")
             .setSmallIcon(R.drawable.ic_mouse)
             .setContentIntent(pendingIntent)
+            .addAction(R.drawable.ic_mouse, dockActionLabel, toggleDockPending)
             .addAction(R.drawable.ic_toggle, "Stop", stopPendingIntent)
             .setOngoing(true)
             .build()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ACTION_STOP) {
-            stopSelf()
-            return START_NOT_STICKY
+        when (intent?.action) {
+            ACTION_STOP -> {
+                stopSelf()
+                return START_NOT_STICKY
+            }
+            ACTION_TOGGLE_DOCK -> {
+                val next = !prefs.getBoolean("show_dock", true)
+                prefs.edit().putBoolean("show_dock", next).apply()
+            }
         }
         return START_STICKY
     }
@@ -336,7 +499,12 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
         mainHandler.removeCallbacksAndMessages(null)
         prefs.unregisterOnSharedPreferenceChangeListener(this)
         RootMouseController.setTouchGrab(false)
-        controlsView?.let { windowManager.removeView(it) }
+        imeSensorView?.let {
+            try { windowManager.removeView(it) } catch (ignored: Exception) {}
+        }
+        controlsView?.let {
+            try { windowManager.removeView(it) } catch (ignored: Exception) {}
+        }
         RootMouseController.stop()
     }
 }

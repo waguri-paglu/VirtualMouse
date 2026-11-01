@@ -4,37 +4,38 @@
     android:layout_height="wrap_content"
     android:orientation="horizontal"
     android:background="@drawable/bg_floating_pill"
-    android:padding="8dp"
+    android:padding="6dp"
     android:gravity="center_vertical">
 
     <!-- Drag Handle -->
     <View
         android:id="@+id/drag_handle"
-        android:layout_width="16dp"
-        android:layout_height="32dp"
+        android:layout_width="12dp"
+        android:layout_height="28dp"
+        android:layout_marginStart="4dp"
         android:layout_marginEnd="6dp"
-        android:background="#475569" />
+        android:background="#64748B" />
 
     <!-- Left Click Button -->
     <Button
         android:id="@+id/btn_left_click"
-        android:layout_width="64dp"
-        android:layout_height="48dp"
+        android:layout_width="58dp"
+        android:layout_height="44dp"
         android:text="L"
         android:textStyle="bold"
         android:textColor="#FFFFFF"
         android:backgroundTint="#3B82F6"
+        android:insetTop="0dp"
+        android:insetBottom="0dp"
         android:layout_marginEnd="6dp" />
 
-    <!-- Mode Toggle Button (Trackpad <-> Normal Touch Passthrough) -->
+    <!-- Mode Toggle Button -->
     <LinearLayout
         android:id="@+id/btn_toggle_mode"
-        android:layout_width="wrap_content"
-        android:layout_height="48dp"
+        android:layout_width="76dp"
+        android:layout_height="44dp"
         android:orientation="vertical"
         android:gravity="center"
-        android:paddingStart="12dp"
-        android:paddingEnd="12dp"
         android:background="@drawable/bg_floating_button"
         android:clickable="true"
         android:focusable="true">
@@ -43,7 +44,7 @@
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:text="MODE"
-            android:textSize="9sp"
+            android:textSize="8sp"
             android:textColor="#94A3B8" />
 
         <TextView
@@ -52,19 +53,36 @@
             android:layout_height="wrap_content"
             android:text="TRACKPAD"
             android:textStyle="bold"
-            android:textSize="12sp"
+            android:textSize="11sp"
             android:textColor="#10B981" />
     </LinearLayout>
 
     <!-- Right Click Button -->
     <Button
         android:id="@+id/btn_right_click"
-        android:layout_width="64dp"
-        android:layout_height="48dp"
+        android:layout_width="58dp"
+        android:layout_height="44dp"
         android:text="R"
         android:textStyle="bold"
         android:textColor="#FFFFFF"
         android:backgroundTint="#6366F1"
+        android:insetTop="0dp"
+        android:insetBottom="0dp"
         android:layout_marginStart="6dp" />
+
+    <!-- Hide Overlay Button -->
+    <TextView
+        android:id="@+id/btn_hide_dock"
+        android:layout_width="40dp"
+        android:layout_height="44dp"
+        android:layout_marginStart="6dp"
+        android:gravity="center"
+        android:background="@drawable/bg_floating_button"
+        android:text="✕"
+        android:textColor="#94A3B8"
+        android:textSize="14sp"
+        android:textStyle="bold"
+        android:clickable="true"
+        android:focusable="true" />
 
 </LinearLayout>
