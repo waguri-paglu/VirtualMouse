@@ -53,13 +53,14 @@ jobs:
             echo "ERROR: No APK found!"
             exit 1
           fi
+          cp "$APK_FILE" app/build/outputs/apk/VirtualMouse-v1.2.0-Release.apk
           echo "Found APK: $APK_FILE"
-          echo "apk_path=$APK_FILE" >> $GITHUB_OUTPUT
+          echo "apk_path=app/build/outputs/apk/VirtualMouse-v1.2.0-Release.apk" >> $GITHUB_OUTPUT
 
       - name: Upload Build Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: VirtualMouse-APK
+          name: VirtualMouse-v1.2.0-APK
           path: ${{ steps.apk.outputs.apk_path }}
 
       - name: Determine Release Tag
@@ -76,32 +77,37 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ steps.apk.outputs.apk_path }}
-          name: "Virtual Mouse ${{ steps.release_info.outputs.tag }}"
+          name: "Virtual Mouse ${{ steps.release_info.outputs.tag }} (Material You & Multi-Touch Engine)"
           tag_name: ${{ steps.release_info.outputs.tag }}
           draft: false
           prerelease: false
           body: |
-            ## Virtual Mouse for Rooted Android 🖱️📱
+            ## Virtual Mouse v1.2.0 — Material You & Kernel EVIOCGRAB Update 🖱️📱
             
-            Turn your entire mobile screen into a responsive laptop-style trackpad with a genuine system-wide mouse cursor arrow and full left/right click capabilities.
+            Turn your entire mobile or tablet display into a zero-latency laptop trackpad powered by Linux `/dev/uinput` and `EVIOCGRAB` kernel touchscreen capture.
             
-            ### ✨ Features Included:
-            - **Native Linux Kernel Pointer**: Powered by `/dev/uinput` for real OS arrow rendering and zero latency.
-            - **Full-Screen Trackpad**: The entire screen captures touch motions.
-            - **Gesture Controls**:
-              - 1-Finger Move: Move mouse cursor.
-              - 1-Finger Tap: Left Click (`BTN_LEFT`).
-              - 2-Finger Tap: Right Click (`BTN_RIGHT` - context menu/back).
-              - 2-Finger Drag: Smooth vertical & horizontal scrolling (`REL_WHEEL`).
-              - Long-Press & Drag: Click-and-drag for selection.
-            - **Floating Controls**:
-              - Dedicated Left ("L") & Right ("R") thumb buttons.
-              - Draggable Floating Dock.
-              - Quick **MODE** button to toggle between Trackpad and Touch Passthrough without exiting.
+            ---
             
-            ### 📱 Quick Setup:
-            1. Install `VirtualMouse-Release.apk` on a rooted Android device (Magisk / KernelSU / APatch).
-            2. Grant **Root Access** and **Display over other apps** (Overlay) permission.
-            3. Tap **Start Mouse** and enjoy!
+            ### 🚀 What's New in v1.2.0 (Changelog)
+            
+            #### 🎨 Material You (Monet) Design & 2-Tab Navigation
+            - **Google Pixel / Play Store Aesthetic**: Full Material 3 (`Theme.Material3.DayNight.NoActionBar`) with **Monet Dynamic Wallpaper Colors** (`DynamicColors`) on Android 12+.
+            - **Decluttered 2-Tab Layout**: Split into dedicated **Home** and **Settings** tabs via a minimalist bottom navigation bar.
+            - **Responsive Mobile & Tablet UI**: Adapts smoothly across portrait phones, foldables, and landscape tablets.
+            
+            #### 🖐️ New Multi-Touch Trackpad Gestures
+            - **1-Finger Hold + 2nd-Finger Drag**: Hold 1 finger on the screen (`>= 90ms`) to lock the **Left Mouse Button (`BTN_LEFT`) down**, and slide with a 2nd finger to drag items, sliders, or text selections effortlessly (supports multi-stroke dragging until the holding finger lifts).
+            - **Bi-Directional 3-Finger Tap**: Tap anywhere on the screen with **3 fingers** to instantly swap between **Trackpad Mode** and **Normal Touch Mode** in both directions—even when the floating buttons overlay is hidden.
+            - **Zero Conflict with 2-Finger Scroll**: 2-finger smooth wheel scrolling (`REL_WHEEL` / `REL_HWHEEL`) triggers cleanly when two fingers touch down simultaneously and glide together.
+            
+            #### ⌨️ Smart Automation & Hideable Overlay
+            - **Auto-Touch on Keyboard (IME)**: Persistent root monitor detects when Android's soft keyboard opens (`dumpsys input_method` / `InputMethod` window state), automatically switches to **Touch Mode (`TOUCH (KB)`)** so you can type immediately, and switches right back to **Trackpad Mode** as soon as the keyboard closes.
+            - **Hide Floating Mouse Buttons (`✕`)**: Tap `✕` directly on the floating dock, toggle the switch in **Home / Settings**, or use the **"Show/Hide Buttons"** button in the persistent notification to hide the on-screen buttons completely.
+            
+            ---
+            
+            ### 📜 Previous Releases
+            - **v1.1.0**: Introduced kernel-level `ioctl(EVIOCGRAB)` touchscreen capture and C JNI loopback UDP datagrams (`127.0.0.1:29876`) to eliminate cursor hiding/teleportation and overlay click blocking.
+            - **v1.0.0**: Initial `/dev/uinput` virtual hardware mouse daemon and floating L/R/Mode dock.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

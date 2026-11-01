@@ -188,8 +188,7 @@ object RootMouseController {
             try {
                 val p = Runtime.getRuntime().exec("su")
                 imeMonitorProcess = p
-                val script = "while true; do if dumpsys input_method 2>/dev/null | grep -qE "mInputShown=true|isInputViewShown=true|mImeWindowVis=0x[2367abef]|imeWindowVis=0x[2367abef]"; then echo "IME_VIS:1"; elif dumpsys window InputMethod 2>/dev/null | grep -qE "isVisible=true|isOnScreen=true"; then echo "IME_VIS:1"; else echo "IME_VIS:0"; fi; sleep 0.25; done
-"
+                val script = "while true; do if dumpsys input_method 2>/dev/null | grep -qE 'mInputShown=true|isInputViewShown=true|mImeWindowVis=0x[2367abef]|imeWindowVis=0x[2367abef]'; then echo 'IME_VIS:1'; elif dumpsys window InputMethod 2>/dev/null | grep -qE 'isVisible=true|isOnScreen=true'; then echo 'IME_VIS:1'; else echo 'IME_VIS:0'; fi; sleep 0.25; done\n"
 
                 p.outputStream.write(script.toByteArray())
                 p.outputStream.flush()
