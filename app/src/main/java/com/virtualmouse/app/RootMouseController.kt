@@ -4,8 +4,10 @@ import android.content.Context
 import android.os.Build
 import android.os.SystemClock
 import android.util.Log
+import java.io.BufferedReader
 import java.io.File
 import java.io.FileOutputStream
+import java.io.InputStreamReader
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
@@ -15,8 +17,8 @@ import java.util.concurrent.Executors
 import java.util.zip.ZipFile
 
 /**
- * Manages the root uinput + EVIOCGRAB kernel daemon and syncs screen config,
- * floating dock button coordinates, and Trackpad/Touch/Hide states.
+ * Manages the root uinput + EVIOCGRAB kernel daemon, syncs screen config & dock bounds,
+ * and runs a persistent root IME monitor to detect when Android's soft keyboard opens/closes.
  */
 object RootMouseController {
     private const val TAG = "RootMouseController"
@@ -57,10 +59,12 @@ object RootMouseController {
     @Volatile private var isRunning = false
     @Volatile private var isStarting = false
     @Volatile private var callbackSocket: DatagramSocket? = null
+    @Volatile private var imeMonitorProcess: Process? = null
     private val executor = Executors.newCachedThreadPool()
 
     var onStateChanged: ((DriverState, String) -> Unit)? = null
     var onDaemonEvent: ((Int) -> Unit)? = null
+    var onImeVisibilityChanged: ((Boolean) -> Unit)? = null
 
     fun isRootAvailable(): Boolean {
         return try {
@@ -130,6 +134,7 @@ object RootMouseController {
                     isRunning = true
                     isStarting = false
                     startCallbackListener()
+                    startRootImeMonitor()
                     notifyState(DriverState.RUNNING, "Virtual mouse active")
                     onResult(true, null)
                 } else {
@@ -170,6 +175,41 @@ object RootMouseController {
         }
     }
 
+    /**
+     * Persistent background root shell that monitors InputMethodManagerService & WindowManager
+     * for soft keyboard visibility across all apps on Android 10-15 and HyperOS/MIUI.
+     */
+    private fun startRootImeMonitor() {
+        try {
+            imeMonitorProcess?.destroy()
+        } catch (ignored: Exception) {}
+
+        executor.execute {
+            try {
+                val p = Runtime.getRuntime().exec("su")
+                imeMonitorProcess = p
+                val script = "while true; do if dumpsys input_method 2>/dev/null | grep -qE "mInputShown=true|isInputViewShown=true|mImeWindowVis=0x[2367abef]|imeWindowVis=0x[2367abef]"; then echo "IME_VIS:1"; elif dumpsys window InputMethod 2>/dev/null | grep -qE "isVisible=true|isOnScreen=true"; then echo "IME_VIS:1"; else echo "IME_VIS:0"; fi; sleep 0.25; done
+"
+
+                p.outputStream.write(script.toByteArray())
+                p.outputStream.flush()
+
+                val reader = BufferedReader(InputStreamReader(p.inputStream))
+                var lastVis = false
+                while (isRunning) {
+                    val line = reader.readLine() ?: break
+                    if (line.startsWith("IME_VIS:")) {
+                        val vis = line.endsWith("1")
+                        if (vis != lastVis) {
+                            lastVis = vis
+                            onImeVisibilityChanged?.invoke(vis)
+                        }
+                    }
+                }
+            } catch (ignored: Exception) {}
+        }
+    }
+
     private fun notifyState(state: DriverState, message: String) {
         onStateChanged?.invoke(state, message)
     }
@@ -186,6 +226,11 @@ object RootMouseController {
         try {
             callbackSocket?.close()
             callbackSocket = null
+        } catch (ignored: Exception) {}
+
+        try {
+            imeMonitorProcess?.destroy()
+            imeMonitorProcess = null
         } catch (ignored: Exception) {}
 
         executor.execute {

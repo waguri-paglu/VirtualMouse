@@ -90,6 +90,12 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
             startForeground(NOTIFICATION_ID, createNotification())
         }
 
+        RootMouseController.onImeVisibilityChanged = { visible ->
+            mainHandler.post {
+                handleKeyboardVisibilityChange(visible)
+            }
+        }
+
         RootMouseController.onDaemonEvent = { eventCode ->
             mainHandler.post {
                 when (eventCode) {

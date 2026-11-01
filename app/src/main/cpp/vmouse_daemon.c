@@ -3,11 +3,15 @@
  *
  * Features:
  * 1. Genuine /dev/uinput hardware mouse (EV_REL + BTN_LEFT/BTN_RIGHT/BTN_MIDDLE)
- * 2. Kernel EVIOCGRAB touchscreen capture in Trackpad Mode (prevents Android TouchInputMapper
- *    from ever hiding or freezing the native mouse cursor)
- * 3. Gesture: 1-Finger Hold + 2nd-Finger Drag -> holds BTN_LEFT down and drags cursor
- * 4. Gesture: Bi-directional 3-Finger Tap -> swaps Trackpad <-> Touch mode in both states!
- * 5. Dock Zone Mapping: L, MODE, R, and HIDE overlay buttons
+ * 2. Kernel EVIOCGRAB touchscreen capture in Trackpad Mode
+ * 3. Gesture: 1-Finger Hold + 2nd-Finger Drag:
+ *    - Hold 1st finger on screen (>90ms, or stationary when 2nd finger touches down)
+ *    - 1st finger immediately holds LMB down (BTN_LEFT = 1)
+ *    - 2nd finger exclusively controls cursor movement (REL_X, REL_Y)
+ *    - Supports multi-stroke dragging (lifting and re-placing 2nd finger while 1st finger stays held)
+ *    - Releases BTN_LEFT = 0 when 1st finger lifts!
+ * 4. Gesture: 2-Finger Scroll (only when both fingers touch down together <90ms apart and slide together)
+ * 5. Gesture: Bi-directional 3-Finger Tap -> swaps Trackpad <-> Touch mode in both states!
  */
 
 #include <stdio.h>
@@ -147,11 +151,9 @@ static int sock_fd = -1;
 static volatile int keep_running = 1;
 static int is_grabbed = 0;
 
-/* Touchscreen hardware axis bounds */
 static int touch_min_x = 0, touch_max_x = 1080;
 static int touch_min_y = 0, touch_max_y = 2400;
 
-/* Current display dimensions & settings */
 static int screen_w = 1080;
 static int screen_h = 2400;
 static int screen_rotation = 0;
@@ -159,7 +161,6 @@ static float pointer_sens = 1.4f;
 static float scroll_sens = 0.5f;
 static int three_finger_tap_enabled = 1;
 
-/* Floating dock rectangle in screen pixel coordinates (0,0,0,0 when hidden) */
 static int dock_left = 0;
 static int dock_top = 0;
 static int dock_right = 0;
@@ -184,12 +185,13 @@ struct touch_slot {
     int prev_y;
     int down_x;
     int down_y;
+    int anchor_x; /* Position of 1st finger at the moment 2nd finger touched down */
+    int anchor_y;
     int64_t down_time_ms;
     int role;
     int just_down;
     int just_up;
     int moved_beyond_tap;
-    int drag_locked;
 };
 
 static struct touch_slot slots[MAX_SLOTS];
@@ -206,7 +208,7 @@ static int hold_anchor_slot = -1;
 static int last_mid_x = 0;
 static int last_mid_y = 0;
 
-/* 3-finger tap detector (works in BOTH grabbed and ungrabbed modes!) */
+/* 3-finger tap detector */
 static int gesture_max_fingers = 0;
 static int64_t gesture_start_ms = 0;
 static int gesture_moved_too_far = 0;
@@ -527,12 +529,6 @@ static int classify_dock_zone(int sx, int sy) {
         if (sx >= dock_left && sx <= dock_right && sy >= dock_top && sy <= dock_bottom) {
             int width = dock_right - dock_left;
             int rel_x = sx - dock_left;
-            /* 4 zones on floating dock:
-             * [0%..28%]: Left Click (L)
-             * [28%..56%]: Mode Toggle (MODE)
-             * [56%..82%]: Right Click (R)
-             * [82%..100%]: Hide Overlay Button (X)
-             */
             if (rel_x < (width * 28) / 100) {
                 return ROLE_BTN_L;
             } else if (rel_x < (width * 56) / 100) {
@@ -571,15 +567,12 @@ static void emit_scaled_move(int raw_dx, int raw_dy) {
     }
 }
 
-/*
- * Runs on every SYN_REPORT in BOTH Trackpad Mode (is_grabbed=1) AND Touch Mode (is_grabbed=0)
- * so 3-finger tap can toggle modes bi-directionally!
- */
 static void process_touch_frame_syn(void) {
     int64_t now = now_ms();
     int active_trackpad_slots[MAX_SLOTS];
     int active_trackpad_count = 0;
     int total_active_fingers = 0;
+    int new_trackpad_finger_down = 0;
 
     for (int i = 0; i < MAX_SLOTS; i++) {
         struct touch_slot *s = &slots[i];
@@ -594,9 +587,10 @@ static void process_touch_frame_syn(void) {
             s->prev_y = s->screen_y;
             s->down_x = s->screen_x;
             s->down_y = s->screen_y;
+            s->anchor_x = s->screen_x;
+            s->anchor_y = s->screen_y;
             s->down_time_ms = now;
             s->moved_beyond_tap = 0;
-            s->drag_locked = 0;
 
             if (is_grabbed) {
                 s->role = classify_dock_zone(s->screen_x, s->screen_y);
@@ -608,6 +602,8 @@ static void process_touch_frame_syn(void) {
                     pending_mode_swap = 1;
                 } else if (s->role == ROLE_BTN_HIDE) {
                     pending_hide_overlay = 1;
+                } else if (s->role == ROLE_TRACKPAD) {
+                    new_trackpad_finger_down = 1;
                 }
             } else {
                 s->role = ROLE_TRACKPAD;
@@ -625,7 +621,6 @@ static void process_touch_frame_syn(void) {
         }
     }
 
-    /* Track multi-finger gesture peak count for 3-Finger Tap detection */
     if (total_active_fingers > 0) {
         if (gesture_max_fingers == 0) {
             gesture_start_ms = now;
@@ -636,7 +631,7 @@ static void process_touch_frame_syn(void) {
         }
     }
 
-    /* If we are in Normal Touch mode (is_grabbed == 0), only watch for 3-Finger Tap! */
+    /* In Normal Touch mode (is_grabbed == 0), watch for 3-Finger Tap to switch back to Trackpad! */
     if (!is_grabbed) {
         for (int i = 0; i < MAX_SLOTS; i++) {
             if (slots[i].just_up) {
@@ -649,7 +644,6 @@ static void process_touch_frame_syn(void) {
             int64_t gesture_dur = now - gesture_start_ms;
             if (three_finger_tap_enabled && gesture_max_fingers == 3 &&
                 !gesture_moved_too_far && gesture_dur < 420) {
-                /* 3-Finger Tap in Touch Mode -> Switch to Trackpad Mode! */
                 gesture_max_fingers = 0;
                 set_touch_grab(1);
                 return;
@@ -660,7 +654,7 @@ static void process_touch_frame_syn(void) {
     }
 
     /* ========================================================================
-     * Below runs ONLY when is_grabbed == 1 (Trackpad Mode)
+     * Trackpad Mode (is_grabbed == 1)
      * ======================================================================== */
     if (active_trackpad_count == 2 && gesture_max_fingers < 3) {
         int idx0 = active_trackpad_slots[0];
@@ -668,30 +662,48 @@ static void process_touch_frame_syn(void) {
         struct touch_slot *s0 = &slots[idx0];
         struct touch_slot *s1 = &slots[idx1];
 
-        /* Order so first_finger is the one that touched down earlier */
-        struct touch_slot *first_f = (s0->down_time_ms <= s1->down_time_ms) ? s0 : s1;
-        struct touch_slot *second_f = (s0->down_time_ms <= s1->down_time_ms) ? s1 : s0;
+        /* Identify earlier (1st) finger and later (2nd) finger */
         int first_idx = (s0->down_time_ms <= s1->down_time_ms) ? idx0 : idx1;
+        int second_idx = (s0->down_time_ms <= s1->down_time_ms) ? idx1 : idx0;
+        struct touch_slot *first_f = &slots[first_idx];
+        struct touch_slot *second_f = &slots[second_idx];
 
-        int first_moved_sq = dist_sq(first_f->screen_x, first_f->screen_y, first_f->down_x, first_f->down_y);
-        int second_moved_sq = dist_sq(second_f->screen_x, second_f->screen_y, second_f->down_x, second_f->down_y);
+        /* When 2nd finger just touched down, snapshot 1st finger's current position as anchor! */
+        if (new_trackpad_finger_down) {
+            first_f->anchor_x = first_f->screen_x;
+            first_f->anchor_y = first_f->screen_y;
+            int64_t time_gap = second_f->down_time_ms - first_f->down_time_ms;
 
-        /*
-         * GESTURE 1: One-Finger Touch & Hold + Second-Finger Drag!
-         * Triggered when:
-         * - First finger is held stationary (moved < 30px from its down point)
-         * - AND either Hold-and-Drag is already active, OR second finger moves (> 12px) while first finger stays still
-         */
-        if (hold_and_drag_mode || (!two_finger_scroll_mode && first_moved_sq < (30 * 30) && second_moved_sq > (12 * 12))) {
-            if (!hold_and_drag_mode) {
-                hold_and_drag_mode = 1;
-                hold_anchor_slot = first_idx;
-                first_f->moved_beyond_tap = 1;
-                second_f->moved_beyond_tap = 1;
-                emit_single_with_syn(uinput_fd, EV_KEY, BTN_LEFT, 1);
+            /*
+             * If 1st finger was already held on the screen for >= 90ms before 2nd finger touched down,
+             * immediately engage Hold-and-Drag (1st finger holds LMB, 2nd finger moves cursor)!
+             */
+            if (time_gap >= 90 && !two_finger_scroll_mode) {
+                if (!hold_and_drag_mode) {
+                    hold_and_drag_mode = 1;
+                    hold_anchor_slot = first_idx;
+                    first_f->moved_beyond_tap = 1;
+                    second_f->moved_beyond_tap = 1;
+                    emit_single_with_syn(uinput_fd, EV_KEY, BTN_LEFT, 1);
+                }
             }
+        }
 
-            /* Move cursor according to the dragging finger! */
+        /* Also check if 1st finger is stationary near its anchor while 2nd finger drags */
+        int first_drift_sq = dist_sq(first_f->screen_x, first_f->screen_y, first_f->anchor_x, first_f->anchor_y);
+        int second_drag_sq = dist_sq(second_f->screen_x, second_f->screen_y, second_f->down_x, second_f->down_y);
+
+        if (!hold_and_drag_mode && !two_finger_scroll_mode &&
+            first_drift_sq < (25 * 25) && second_drag_sq > (20 * 20)) {
+            hold_and_drag_mode = 1;
+            hold_anchor_slot = first_idx;
+            first_f->moved_beyond_tap = 1;
+            second_f->moved_beyond_tap = 1;
+            emit_single_with_syn(uinput_fd, EV_KEY, BTN_LEFT, 1);
+        }
+
+        if (hold_and_drag_mode) {
+            /* Only the 2nd (moving) finger controls the cursor! */
             struct touch_slot *mover = (hold_anchor_slot == idx0) ? s1 : s0;
             int raw_dx = mover->screen_x - mover->prev_x;
             int raw_dy = mover->screen_y - mover->prev_y;
@@ -701,13 +713,13 @@ static void process_touch_frame_syn(void) {
             s1->prev_y = s1->screen_y;
 
             emit_scaled_move(raw_dx, raw_dy);
-        } else if (!hold_and_drag_mode) {
-            /* Standard 2-Finger Scroll when both fingers move together */
+        } else {
+            /* Standard 2-Finger Scroll when both fingers were placed together (<90ms) and move together */
             int mid_x = (s0->screen_x + s1->screen_x) / 2;
             int mid_y = (s0->screen_y + s1->screen_y) / 2;
 
             if (!two_finger_scroll_mode) {
-                if (first_moved_sq > (22 * 22) && second_moved_sq > (22 * 22)) {
+                if (first_drift_sq > (20 * 20) && second_drag_sq > (20 * 20)) {
                     two_finger_scroll_mode = 1;
                     last_mid_x = mid_x;
                     last_mid_y = mid_y;
@@ -750,7 +762,7 @@ static void process_touch_frame_syn(void) {
         s->prev_y = s->screen_y;
 
         if (hold_and_drag_mode) {
-            /* If user lifted the 2nd dragging finger while still holding anchor finger, keep BTN_LEFT held! */
+            /* If 1st anchor finger is held alone (2nd finger lifted for multi-stroke), keep BTN_LEFT held! */
             if (idx != hold_anchor_slot) {
                 emit_scaled_move(raw_dx, raw_dy);
             }
@@ -758,11 +770,7 @@ static void process_touch_frame_syn(void) {
             int dist_from_down_sq = dist_sq(s->screen_x, s->screen_y, s->down_x, s->down_y);
             if (dist_from_down_sq > (24 * 24)) {
                 s->moved_beyond_tap = 1;
-            } else if (!s->moved_beyond_tap && !s->drag_locked && (now - s->down_time_ms) >= 420) {
-                s->drag_locked = 1;
-                emit_single_with_syn(uinput_fd, EV_KEY, BTN_LEFT, 1);
             }
-
             emit_scaled_move(raw_dx, raw_dy);
         }
     }
@@ -781,12 +789,9 @@ static void process_touch_frame_syn(void) {
                 emit_single_with_syn(uinput_fd, EV_KEY, BTN_RIGHT, 0);
             } else if (s->role == ROLE_TRACKPAD) {
                 if (hold_and_drag_mode && i == hold_anchor_slot) {
-                    /* Anchor finger lifted -> end Hold-and-Drag */
+                    /* Anchor finger lifted -> release BTN_LEFT! */
                     hold_and_drag_mode = 0;
                     hold_anchor_slot = -1;
-                    emit_single_with_syn(uinput_fd, EV_KEY, BTN_LEFT, 0);
-                } else if (s->drag_locked) {
-                    s->drag_locked = 0;
                     emit_single_with_syn(uinput_fd, EV_KEY, BTN_LEFT, 0);
                 } else if (!hold_and_drag_mode && !two_finger_scroll_mode &&
                            gesture_max_fingers == 1 && !s->moved_beyond_tap && duration < 220) {
@@ -817,7 +822,7 @@ static void process_touch_frame_syn(void) {
             emit_single_with_syn(uinput_fd, EV_KEY, BTN_RIGHT, 0);
         } else if (three_finger_tap_enabled && gesture_max_fingers == 3 &&
                    !gesture_moved_too_far && gesture_dur < 420) {
-            /* 3-Finger Tap in Trackpad Mode -> Swap to Touch Mode! */
+            /* 3-Finger Tap -> Swap to Touch Mode! */
             pending_mode_swap = 1;
         }
 
@@ -914,7 +919,6 @@ static void handle_udp_packet(
             set_touch_grab(pkt->arg1);
             break;
         case CMD_SET_CONFIG:
-            /* arg1 = sens * 100, arg2 = scroll_sens * 100, arg3 = screen_w, arg4 = screen_h | (rot << 16) | (three_finger << 20) */
             if (pkt->arg1 > 0) pointer_sens = (float)pkt->arg1 / 100.0f;
             if (pkt->arg2 > 0) scroll_sens = (float)pkt->arg2 / 100.0f;
             if (pkt->arg3 > 0) screen_w = pkt->arg3;
