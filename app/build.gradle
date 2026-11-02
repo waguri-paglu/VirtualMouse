@@ -3,6 +3,8 @@ plugins {
     id 'org.jetbrains.kotlin.android'
 }
 
+def runNumber = System.getenv("GITHUB_RUN_NUMBER") ? System.getenv("GITHUB_RUN_NUMBER").toInteger() : 1
+
 android {
     namespace 'com.virtualmouse.app'
     compileSdk 34
@@ -12,7 +14,7 @@ android {
         applicationId "com.virtualmouse.app"
         minSdk 26
         targetSdk 34
-        versionCode 2
+        versionCode 10 + runNumber
         versionName "1.2.0"
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
@@ -29,6 +31,17 @@ android {
         }
     }
 
+    signingConfigs {
+        releaseConfig {
+            storeFile file("vmouse.keystore")
+            storePassword "vmouse123"
+            keyAlias "vmouse_key"
+            keyPassword "vmouse123"
+            enableV1Signing true
+            enableV2Signing true
+        }
+    }
+
     packaging {
         jniLibs {
             useLegacyPackaging = true
@@ -36,10 +49,13 @@ android {
     }
 
     buildTypes {
+        debug {
+            signingConfig signingConfigs.releaseConfig
+        }
         release {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
-            signingConfig signingConfigs.debug
+            signingConfig signingConfigs.releaseConfig
         }
     }
 

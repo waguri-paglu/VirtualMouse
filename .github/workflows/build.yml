@@ -43,24 +43,43 @@ jobs:
           chmod +x gradlew || true
 
       - name: Build Release APK
-        run: ./gradlew assembleRelease --stacktrace || gradle assembleRelease --stacktrace
+        run: ./gradlew assembleRelease --no-daemon --stacktrace || gradle assembleRelease --no-daemon --stacktrace
 
-      - name: Locate Built APK
+      - name: Align, Sign & Verify APK Integrity
         id: apk
         run: |
-          APK_FILE=$(find app/build/outputs/apk -name "*.apk" | head -n 1)
-          if [ -z "$APK_FILE" ]; then
+          RAW_APK=$(find app/build/outputs/apk/release -name "*.apk" | head -n 1)
+          if [ -z "$RAW_APK" ]; then
+            RAW_APK=$(find app/build/outputs/apk -name "*.apk" | head -n 1)
+          fi
+          if [ -z "$RAW_APK" ]; then
             echo "ERROR: No APK found!"
             exit 1
           fi
-          cp "$APK_FILE" app/build/outputs/apk/VirtualMouse-v1.2.0-Release.apk
-          echo "Found APK: $APK_FILE"
-          echo "apk_path=app/build/outputs/apk/VirtualMouse-v1.2.0-Release.apk" >> $GITHUB_OUTPUT
+          echo "Found built APK: $RAW_APK"
+
+          BUILD_TOOLS_DIR=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -n 1)
+          ZIPALIGN="$BUILD_TOOLS_DIR/zipalign"
+          APKSIGNER="$BUILD_TOOLS_DIR/apksigner"
+
+          OUT_NAME="VirtualMouse-v1.2.0-build-${{ github.run_number }}.apk"
+          OUT_PATH="app/build/outputs/apk/$OUT_NAME"
+
+          "$ZIPALIGN" -p -f -v 4 "$RAW_APK" "$OUT_PATH.aligned"
+          "$APKSIGNER" sign             --ks app/vmouse.keystore             --ks-pass pass:vmouse123             --key-pass pass:vmouse123             --ks-key-alias vmouse_key             --v1-signing-enabled true             --v2-signing-enabled true             --v3-signing-enabled true             --out "$OUT_PATH"             "$OUT_PATH.aligned"
+          rm -f "$OUT_PATH.aligned"
+
+          echo "Verifying APK zip structure and V1/V2/V3 signatures..."
+          unzip -t "$OUT_PATH" >/dev/null
+          "$APKSIGNER" verify --verbose --print-certs "$OUT_PATH"
+
+          echo "apk_path=$OUT_PATH" >> $GITHUB_OUTPUT
+          echo "apk_name=$OUT_NAME" >> $GITHUB_OUTPUT
 
       - name: Upload Build Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: VirtualMouse-v1.2.0-APK
+          name: VirtualMouse-v1.2.0-build-${{ github.run_number }}
           path: ${{ steps.apk.outputs.apk_path }}
 
       - name: Determine Release Tag
@@ -77,14 +96,14 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ steps.apk.outputs.apk_path }}
-          name: "Virtual Mouse ${{ steps.release_info.outputs.tag }} (Material You & Multi-Touch Engine)"
+          name: "Virtual Mouse ${{ steps.release_info.outputs.tag }} (Build #${{ github.run_number }})"
           tag_name: ${{ steps.release_info.outputs.tag }}
           draft: false
           prerelease: false
           body: |
-            ## Virtual Mouse v1.2.0 — Material You & Kernel EVIOCGRAB Update 🖱️📱
+            ## Virtual Mouse v1.2.0 (Build #${{ github.run_number }}) — Material You & Kernel EVIOCGRAB Update 🖱️📱
             
-            Turn your entire mobile or tablet display into a zero-latency laptop trackpad powered by Linux `/dev/uinput` and `EVIOCGRAB` kernel touchscreen capture.
+            👉 **Download the latest verified APK**: **`${{ steps.apk.outputs.apk_name }}`**
             
             ---
             
@@ -93,22 +112,16 @@ jobs:
             #### 🎨 Material You (Monet) Design & 2-Tab Navigation
             - **Google Pixel / Play Store Aesthetic**: Full Material 3 (`Theme.Material3.DayNight.NoActionBar`) with **Monet Dynamic Wallpaper Colors** (`DynamicColors`) on Android 12+.
             - **Decluttered 2-Tab Layout**: Split into dedicated **Home** and **Settings** tabs via a minimalist bottom navigation bar.
-            - **Responsive Mobile & Tablet UI**: Adapts smoothly across portrait phones, foldables, and landscape tablets.
             
-            #### 🖐️ New Multi-Touch Trackpad Gestures
-            - **1-Finger Hold + 2nd-Finger Drag**: Hold 1 finger on the screen (`>= 90ms`) to lock the **Left Mouse Button (`BTN_LEFT`) down**, and slide with a 2nd finger to drag items, sliders, or text selections effortlessly (supports multi-stroke dragging until the holding finger lifts).
-            - **Bi-Directional 3-Finger Tap**: Tap anywhere on the screen with **3 fingers** to instantly swap between **Trackpad Mode** and **Normal Touch Mode** in both directions—even when the floating buttons overlay is hidden.
-            - **Zero Conflict with 2-Finger Scroll**: 2-finger smooth wheel scrolling (`REL_WHEEL` / `REL_HWHEEL`) triggers cleanly when two fingers touch down simultaneously and glide together.
+            #### 🖐️ Multi-Touch Trackpad Gestures
+            - **Bi-Directional 1-Finger Hold + 2nd-Finger Drag**: Works regardless of which finger touches first—hold one finger still (`BTN_LEFT=1`) and slide the other finger to drag items, sliders, or text selections.
+            - **Smooth 2-Finger Scroll (`REL_WHEEL` + `REL_WHEEL_HI_RES`)**: Slide two fingers together vertically or horizontally to scroll with automatic recovery if one finger slips first.
+            - **Bi-Directional 3-Finger Tap**: Tap anywhere with 3 fingers to swap between **Trackpad Mode** and **Normal Touch Mode** in both directions.
             
-            #### ⌨️ Quick Settings Tile, Smart Automation & Hideable Overlay
-            - **Quick Settings (QS) Toggle Tile**: Start and stop Virtual Mouse from anywhere in a single tap from your notification shade Quick Settings panel.
-            - **Auto-Touch on Keyboard (IME)**: Persistent root monitor detects when Android's soft keyboard opens (`dumpsys input_method` / `InputMethod` window state), automatically switches to **Touch Mode (`TOUCH (KB)`)** so you can type immediately, and switches right back to **Trackpad Mode** as soon as the keyboard closes.
-            - **Hide Floating Mouse Buttons (`✕`)**: Tap `✕` directly on the floating dock, toggle the switch in **Home / Settings**, or use the **"Show/Hide Buttons"** button in the persistent notification to hide the on-screen buttons completely.
-            
-            ---
-            
-            ### 📜 Previous Releases
-            - **v1.1.0**: Introduced kernel-level `ioctl(EVIOCGRAB)` touchscreen capture and C JNI loopback UDP datagrams (`127.0.0.1:29876`) to eliminate cursor hiding/teleportation and overlay click blocking.
-            - **v1.0.0**: Initial `/dev/uinput` virtual hardware mouse daemon and floating L/R/Mode dock.
+            #### ⌨️ Quick Settings Tile, Touch Mode Slot Flush & Smart Automation
+            - **Quick Settings (QS) Toggle Tile**: Start and stop Virtual Mouse in a single tap from your notification shade.
+            - **Clean Touch Mode Transitions**: Flushes multi-touch slots (`ABS_MT_SLOT 0..9 -> -1`) and waits for fingers to lift before toggling `EVIOCGRAB`, preventing stuck ghost fingers or broken Back/Home/Recents/Screenshot gestures.
+            - **Auto-Touch on Keyboard (IME)**: Automatically switches to **Touch Mode (`TOUCH (KB)`)** when the keyboard opens and restores **Trackpad Mode** when it closes.
+            - **Hide Floating Mouse Buttons (`✕`)**: Hide or restore the on-screen buttons via the `✕` button, Settings, or notification action.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
