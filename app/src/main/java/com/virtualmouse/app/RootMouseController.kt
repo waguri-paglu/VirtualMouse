@@ -13,12 +13,13 @@ import java.net.DatagramSocket
 import java.net.InetAddress
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.security.SecureRandom
 import java.util.concurrent.Executors
 import java.util.zip.ZipFile
 
 /**
- * Manages the root uinput + EVIOCGRAB kernel daemon, syncs screen config & dock bounds,
- * and runs a persistent root IME monitor to detect when Android's soft keyboard opens/closes.
+ * Manages the Arrowroot uinput + EVIOCGRAB kernel daemon, session authentication token,
+ * screen config & dock bounds synchronization, and soft keyboard (IME) visibility monitoring.
  */
 object RootMouseController {
     private const val TAG = "RootMouseController"
@@ -36,6 +37,8 @@ object RootMouseController {
     private const val CMD_SET_DOCK = 10
     private const val CMD_QUIT = 99
 
+    private val secureRandom = SecureRandom()
+
     init {
         try {
             System.loadLibrary("vmouse")
@@ -43,6 +46,9 @@ object RootMouseController {
             Log.e(TAG, "Failed to load libvmouse.so", e)
         }
     }
+
+    @JvmStatic
+    external fun nativeSetAuthToken(token: Int)
 
     @JvmStatic
     external fun nativeSendPacket(cmd: Int, arg1: Int, arg2: Int, arg3: Int, arg4: Int): Boolean
@@ -68,7 +74,7 @@ object RootMouseController {
 
     fun isRootAvailable(): Boolean {
         return try {
-            val p = Runtime.getRuntime().exec("su -c id")
+            val p = Runtime.getRuntime().exec(arrayOf("su", "-c", "id"))
             val exitCode = p.waitFor()
             exitCode == 0
         } catch (e: Exception) {
@@ -77,11 +83,22 @@ object RootMouseController {
         }
     }
 
+    fun isUinputAvailable(): Boolean {
+        return try {
+            val p = Runtime.getRuntime().exec(
+                arrayOf("su", "-c", "[ -c /dev/uinput ] || [ -c /dev/input/uinput ]")
+            )
+            p.waitFor() == 0
+        } catch (e: Exception) {
+            false
+        }
+    }
+
     fun isAttached(): Boolean = isRunning
 
     fun startAsync(context: Context, onResult: (Boolean, String?) -> Unit) {
         if (isRunning && nativeSendPacket(CMD_PING, 0, 0, 0, 0)) {
-            notifyState(DriverState.RUNNING, "Virtual mouse active")
+            notifyState(DriverState.RUNNING, "Arrowroot pointer active")
             onResult(true, null)
             return
         }
@@ -95,25 +112,35 @@ object RootMouseController {
                 if (!isRootAvailable()) {
                     isStarting = false
                     notifyState(DriverState.ERROR, "Root permission not granted")
-                    onResult(false, "Root access was denied. Please grant root permission in Magisk/KernelSU/APatch.")
+                    onResult(
+                        false,
+                        "Root access was denied. Please grant superuser permission in Magisk, KernelSU, or APatch."
+                    )
                     return@execute
                 }
 
-                notifyState(DriverState.DEPLOYING, "Deploying uinput native driver...")
+                notifyState(DriverState.DEPLOYING, "Deploying native uinput driver...")
                 val deployedPath = deployDaemonBinary(context)
                 if (deployedPath == null) {
                     isStarting = false
                     notifyState(DriverState.ERROR, "Failed to deploy driver executable")
-                    onResult(false, "Could not extract or deploy driver binary.")
+                    onResult(false, "Could not extract or deploy the native driver binary.")
                     return@execute
                 }
 
                 notifyState(DriverState.CONNECTING, "Registering hardware pointer & EVIOCGRAB...")
 
-                val launchCmd = "killall -9 vmouse_daemon 2>/dev/null || true; " +
-                        "chmod 755 $TARGET_DAEMON_PATH; " +
-                        "chmod 666 /dev/uinput /dev/input/uinput 2>/dev/null || true; " +
-                        "nohup $TARGET_DAEMON_PATH >/dev/null 2>&1 &\nexit\n"
+                var sessionToken = secureRandom.nextInt()
+                if (sessionToken == 0) sessionToken = 0x5A3C9E17
+                nativeSetAuthToken(sessionToken)
+
+                val launchCmd =
+                    "killall -TERM vmouse_daemon 2>/dev/null || true; " +
+                    "sleep 0.06; " +
+                    "killall -9 vmouse_daemon 2>/dev/null || true; " +
+                    "chown 0:0 $TARGET_DAEMON_PATH 2>/dev/null || true; " +
+                    "chmod 700 $TARGET_DAEMON_PATH; " +
+                    "ARROWROOT_TOKEN=$sessionToken nohup $TARGET_DAEMON_PATH >/dev/null 2>&1 &\nexit\n"
 
                 val suProcess = Runtime.getRuntime().exec("su")
                 suProcess.outputStream.write(launchCmd.toByteArray())
@@ -135,7 +162,7 @@ object RootMouseController {
                     isStarting = false
                     startCallbackListener()
                     startRootImeMonitor()
-                    notifyState(DriverState.RUNNING, "Virtual mouse active")
+                    notifyState(DriverState.RUNNING, "Arrowroot pointer active")
                     onResult(true, null)
                 } else {
                     isStarting = false
@@ -166,7 +193,7 @@ object RootMouseController {
                 val pkt = DatagramPacket(buf, buf.size)
                 while (isRunning && !sock.isClosed) {
                     sock.receive(pkt)
-                    if (pkt.length == 4) {
+                    if (pkt.length == 4 && pkt.address.isLoopbackAddress) {
                         val eventCode = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN).int
                         onDaemonEvent?.invoke(eventCode)
                     }
@@ -176,8 +203,9 @@ object RootMouseController {
     }
 
     /**
-     * Persistent background root shell that monitors InputMethodManagerService & WindowManager
-     * for soft keyboard visibility across all apps on Android 10-15 and HyperOS/MIUI.
+     * Background root shell that monitors InputMethodManagerService & WindowManager
+     * for soft keyboard visibility across apps, tied to the daemon lifecycle so it
+     * never outlives vmouse_daemon as an orphan process.
      */
     private fun startRootImeMonitor() {
         try {
@@ -188,7 +216,15 @@ object RootMouseController {
             try {
                 val p = Runtime.getRuntime().exec("su")
                 imeMonitorProcess = p
-                val script = "while true; do if dumpsys input_method 2>/dev/null | grep -qE 'mInputShown=true|isInputViewShown=true|mImeWindowVis=0x[2367abef]|imeWindowVis=0x[2367abef]'; then echo 'IME_VIS:1'; elif dumpsys window InputMethod 2>/dev/null | grep -qE 'isVisible=true|isOnScreen=true'; then echo 'IME_VIS:1'; else echo 'IME_VIS:0'; fi; sleep 0.25; done\n"
+                val script =
+                    "while pidof vmouse_daemon >/dev/null 2>&1; do " +
+                    "if dumpsys input_method 2>/dev/null | grep -qE 'mInputShown=true|isInputViewShown=true|mImeWindowVis=0x[2367abef]|imeWindowVis=0x[2367abef]'; then " +
+                    "echo 'IME_VIS:1'; " +
+                    "elif dumpsys window InputMethod 2>/dev/null | grep -qE 'isVisible=true|isOnScreen=true'; then " +
+                    "echo 'IME_VIS:1'; " +
+                    "else echo 'IME_VIS:0'; fi; " +
+                    "sleep 0.35; " +
+                    "done\nexit\n"
 
                 p.outputStream.write(script.toByteArray())
                 p.outputStream.flush()
@@ -234,12 +270,18 @@ object RootMouseController {
 
         executor.execute {
             try {
-                Runtime.getRuntime().exec(arrayOf("su", "-c", "killall -9 vmouse_daemon")).waitFor()
+                Runtime.getRuntime().exec(
+                    arrayOf(
+                        "su",
+                        "-c",
+                        "killall -TERM vmouse_daemon 2>/dev/null; sleep 0.08; killall -9 vmouse_daemon 2>/dev/null || true"
+                    )
+                ).waitFor()
             } catch (ignored: Exception) {}
         }
 
-        notifyState(DriverState.IDLE, "Virtual mouse stopped")
-        Log.i(TAG, "Root virtual mouse daemon stopped.")
+        notifyState(DriverState.IDLE, "Ready to launch")
+        Log.i(TAG, "Arrowroot daemon stopped.")
     }
 
     fun setTouchGrab(enable: Boolean) {
@@ -318,7 +360,7 @@ object RootMouseController {
 
             if (sourceFile != null && sourceFile!!.exists()) {
                 val sourcePath = sourceFile!!.absolutePath
-                val suCmd = "cp '$sourcePath' '$TARGET_DAEMON_PATH' && chmod 755 '$TARGET_DAEMON_PATH'\nexit\n"
+                val suCmd = "cp '$sourcePath' '$TARGET_DAEMON_PATH' && chown 0:0 '$TARGET_DAEMON_PATH' 2>/dev/null; chmod 700 '$TARGET_DAEMON_PATH'\nexit\n"
                 val p = Runtime.getRuntime().exec("su")
                 p.outputStream.write(suCmd.toByteArray())
                 p.outputStream.flush()

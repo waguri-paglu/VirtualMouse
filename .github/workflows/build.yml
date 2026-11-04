@@ -1,4 +1,4 @@
-name: Build & Release Virtual Mouse APK
+name: Build & Release Arrowroot APK
 
 on:
   push:
@@ -43,10 +43,16 @@ jobs:
           chmod +x gradlew || true
 
       - name: Build Release APK
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD || 'vmouse123' }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD || 'vmouse123' }}
         run: ./gradlew assembleRelease --no-daemon --stacktrace || gradle assembleRelease --no-daemon --stacktrace
 
       - name: Align, Sign & Verify APK Integrity
         id: apk
+        env:
+          KS_PASS: ${{ secrets.KEYSTORE_PASSWORD || 'vmouse123' }}
+          KEY_PASS: ${{ secrets.KEY_PASSWORD || 'vmouse123' }}
         run: |
           RAW_APK=$(find app/build/outputs/apk/release -name "*.apk" | head -n 1)
           if [ -z "$RAW_APK" ]; then
@@ -62,11 +68,20 @@ jobs:
           ZIPALIGN="$BUILD_TOOLS_DIR/zipalign"
           APKSIGNER="$BUILD_TOOLS_DIR/apksigner"
 
-          OUT_NAME="VirtualMouse-v1.2.0-build-${{ github.run_number }}.apk"
+          OUT_NAME="Arrowroot-v1.3.0-build-${{ github.run_number }}.apk"
           OUT_PATH="app/build/outputs/apk/$OUT_NAME"
 
           "$ZIPALIGN" -p -f -v 4 "$RAW_APK" "$OUT_PATH.aligned"
-          "$APKSIGNER" sign             --ks app/vmouse.keystore             --ks-pass pass:vmouse123             --key-pass pass:vmouse123             --ks-key-alias vmouse_key             --v1-signing-enabled true             --v2-signing-enabled true             --v3-signing-enabled true             --out "$OUT_PATH"             "$OUT_PATH.aligned"
+          "$APKSIGNER" sign \
+            --ks app/vmouse.keystore \
+            --ks-pass "pass:$KS_PASS" \
+            --key-pass "pass:$KEY_PASS" \
+            --ks-key-alias vmouse_key \
+            --v1-signing-enabled true \
+            --v2-signing-enabled true \
+            --v3-signing-enabled true \
+            --out "$OUT_PATH" \
+            "$OUT_PATH.aligned"
           rm -f "$OUT_PATH.aligned"
 
           echo "Verifying APK zip structure and V1/V2/V3 signatures..."
@@ -79,7 +94,7 @@ jobs:
       - name: Upload Build Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: VirtualMouse-v1.2.0-build-${{ github.run_number }}
+          name: Arrowroot-v1.3.0-build-${{ github.run_number }}
           path: ${{ steps.apk.outputs.apk_path }}
 
       - name: Determine Release Tag
@@ -88,7 +103,7 @@ jobs:
           if [[ "${{ github.ref }}" == refs/tags/* ]]; then
             TAG="${GITHUB_REF#refs/tags/}"
           else
-            TAG="v1.2.0"
+            TAG="v1.3.0"
           fi
           echo "tag=$TAG" >> $GITHUB_OUTPUT
 
@@ -96,32 +111,36 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ steps.apk.outputs.apk_path }}
-          name: "Virtual Mouse ${{ steps.release_info.outputs.tag }} (Build #${{ github.run_number }})"
+          name: "Arrowroot ${{ steps.release_info.outputs.tag }} (Build #${{ github.run_number }})"
           tag_name: ${{ steps.release_info.outputs.tag }}
           draft: false
           prerelease: false
           body: |
-            ## Virtual Mouse v1.2.0 (Build #${{ github.run_number }}) — Material You & Kernel EVIOCGRAB Update 🖱️📱
-            
+            ## Arrowroot v1.3.0 (Build #${{ github.run_number }}) — Rebrand, Security Hardening & Pro UI Overhaul 🏹🌱
+
             👉 **Download the latest verified APK**: **`${{ steps.apk.outputs.apk_name }}`**
-            
+
             ---
-            
-            ### 🚀 What's New in v1.2.0 (Changelog)
-            
-            #### 🎨 Material You (Monet) Design & 2-Tab Navigation
-            - **Google Pixel / Play Store Aesthetic**: Full Material 3 (`Theme.Material3.DayNight.NoActionBar`) with **Monet Dynamic Wallpaper Colors** (`DynamicColors`) on Android 12+.
-            - **Decluttered 2-Tab Layout**: Split into dedicated **Home** and **Settings** tabs via a minimalist bottom navigation bar.
-            
-            #### 🖐️ Multi-Touch Trackpad Gestures
-            - **Bi-Directional 1-Finger Hold + 2nd-Finger Drag**: Works regardless of which finger touches first—hold one finger still (`BTN_LEFT=1`) and slide the other finger to drag items, sliders, or text selections.
-            - **Smooth 2-Finger Scroll (`REL_WHEEL` + `REL_WHEEL_HI_RES`)**: Slide two fingers together vertically or horizontally to scroll with automatic recovery if one finger slips first.
-            - **Bi-Directional 3-Finger Tap**: Tap anywhere with 3 fingers to swap between **Trackpad Mode** and **Normal Touch Mode** in both directions.
-            
-            #### ⌨️ Quick Settings Tile, Touch Mode Slot Flush & Smart Automation
-            - **Quick Settings (QS) Toggle Tile**: Start and stop Virtual Mouse in a single tap from your notification shade.
-            - **Clean Touch Mode Transitions**: Flushes multi-touch slots (`ABS_MT_SLOT 0..9 -> -1`) and waits for fingers to lift before toggling `EVIOCGRAB`, preventing stuck ghost fingers or broken Back/Home/Recents/Screenshot gestures.
-            - **Auto-Touch on Keyboard (IME)**: Automatically switches to **Touch Mode (`TOUCH (KB)`)** when the keyboard opens and restores **Trackpad Mode** when it closes.
-            - **Hide Floating Mouse Buttons (`✕`)**: Hide or restore the on-screen buttons via the `✕` button, Settings, or notification action.
+
+            ### 🚀 What's New in v1.3.0 (Changelog)
+
+            #### 🏹 Rebranded to **Arrowroot** + Adaptive App Icon
+            - **New Brand Identity**: Renamed from *Virtual Mouse* to **Arrowroot** (*Arrow* cursor + *Root* kernel driver) with a custom adaptive launcher icon across all `mipmap-*` densities (`mdpi` to `xxxhdpi` + `anydpi-v26`) and a monochrome vector icon for the Quick Settings tile and status bar.
+
+            #### 🔒 Kernel & IPC Security Hardening
+            - **Session-Authenticated Loopback IPC**: Added a per-session 32-bit cryptographic token (`SecureRandom`) shared between `RootMouseController` and `vmouse_daemon` with a mutex-protected JNI socket bridge, preventing unauthorized local apps from injecting mouse events or grabbing the screen.
+            - **Eliminated World-Writable `/dev/uinput`**: Removed `chmod 666 /dev/uinput`; the root daemon opens `/dev/uinput` directly with `0700` root-only binary permissions.
+            - **Async-Signal-Safe Daemon Shutdown**: Replaced unsafe `cleanup_device()` calls inside the signal handler with a `sig_atomic_t` flag and graceful `SIGTERM` teardown so `EVIOCGRAB` and `/dev/uinput` always release cleanly.
+
+            #### 🎨 Professional Material 3 UI & UX Upgrade
+            - **Upgraded Home Dashboard**: Live mode badge (`IDLE`, `TRACKPAD MODE`, `TOUCH MODE`, `TOUCH • KEYBOARD`), one-tap **Swap Mode** and **Center Dock** quick actions, and a 3-column **System Diagnostics** grid (`Superuser`, `Kernel uinput`, `Overlay`).
+            - **Refined Floating Overlay Dock**: Persistent dock coordinates across restarts, screen-bounds clamping on rotation, double-tap grip to center, and exact pixel-aligned dock hit zones (`classify_dock_zone`).
+            - **Start on Boot & Settings Reset**: Wired up `BootReceiver` to a new **Start on Boot** preference toggle and added one-tap **Reset All Settings to Default**.
+
+            #### 🐛 Bug Fixes
+            - Fixed `initImeSensorWindow()` not being invoked in `OverlayService.onCreate()` and cleaned up `imeSensorView` in `onDestroy()` to prevent window leaks.
+            - Fixed orphaned root `su` polling shell in `startRootImeMonitor()` by tying its loop to the `vmouse_daemon` PID lifecycle.
+            - Fixed cursor jump on 2-finger right-click and 3-finger mode-swap taps when one finger lifts slightly before the others.
+            - Fixed `INPUT_PROP_DIRECT` touchscreen selection in `open_touchscreen_device()`.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

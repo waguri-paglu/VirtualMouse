@@ -22,7 +22,6 @@ class MainActivity : AppCompatActivity(), SharedPreferences.OnSharedPreferenceCh
     private var isServiceActive = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
-        // Apply Google Pixel Monet Dynamic Wallpaper Colors (Android 12+)
         DynamicColors.applyToActivityIfAvailable(this)
         super.onCreate(savedInstanceState)
 
@@ -43,16 +42,25 @@ class MainActivity : AppCompatActivity(), SharedPreferences.OnSharedPreferenceCh
                 handleDriverState(state, message)
             }
         }
+
+        OverlayService.onModeChanged = { isTrackpad, isKeyboardAuto ->
+            runOnUiThread {
+                updateModeBadge(isServiceActive, isTrackpad, isKeyboardAuto)
+            }
+        }
     }
 
     override fun onDestroy() {
         super.onDestroy()
         prefs.unregisterOnSharedPreferenceChangeListener(this)
+        if (OverlayService.onModeChanged != null) {
+            OverlayService.onModeChanged = null
+        }
     }
 
     override fun onResume() {
         super.onResume()
-        updateRootStatus()
+        updateSystemDiagnostics()
         updateOverlayStatus()
         syncServiceState()
         syncSwitchesFromPrefs()
@@ -70,7 +78,7 @@ class MainActivity : AppCompatActivity(), SharedPreferences.OnSharedPreferenceCh
                 R.id.nav_home -> {
                     binding.pageHome.visibility = View.VISIBLE
                     binding.pageSettings.visibility = View.GONE
-                    binding.tvPageTitle.text = "Virtual Mouse"
+                    binding.tvPageTitle.text = "Arrowroot"
                     true
                 }
                 R.id.nav_settings -> {
@@ -112,6 +120,10 @@ class MainActivity : AppCompatActivity(), SharedPreferences.OnSharedPreferenceCh
         binding.switchHaptics.setOnCheckedChangeListener { _, isChecked ->
             prefs.edit().putBoolean("haptics_enabled", isChecked).apply()
         }
+
+        binding.switchStartOnBoot.setOnCheckedChangeListener { _, isChecked ->
+            prefs.edit().putBoolean("start_on_boot", isChecked).apply()
+        }
     }
 
     private fun syncSwitchesFromPrefs() {
@@ -121,6 +133,7 @@ class MainActivity : AppCompatActivity(), SharedPreferences.OnSharedPreferenceCh
         binding.switchAutoIme.isChecked = prefs.getBoolean("auto_ime_switch", true)
         binding.switchThreeFinger.isChecked = prefs.getBoolean("three_finger_tap", true)
         binding.switchHaptics.isChecked = prefs.getBoolean("haptics_enabled", true)
+        binding.switchStartOnBoot.isChecked = prefs.getBoolean("start_on_boot", false)
     }
 
     private fun setupListeners() {
@@ -142,6 +155,55 @@ class MainActivity : AppCompatActivity(), SharedPreferences.OnSharedPreferenceCh
             } else {
                 startVirtualMouse()
             }
+        }
+
+        binding.btnQuickSwapMode.setOnClickListener {
+            if (!isServiceActive) {
+                Toast.makeText(this, "Start Arrowroot first to swap input modes", Toast.LENGTH_SHORT).show()
+            } else {
+                val intent = Intent(this, OverlayService::class.java).apply {
+                    action = OverlayService.ACTION_SWAP_MODE
+                }
+                startService(intent)
+            }
+        }
+
+        binding.btnResetDock.setOnClickListener {
+            prefs.edit().putInt("dock_x", 0).putInt("dock_y", 120).putBoolean("show_dock", true).apply()
+            syncSwitchesFromPrefs()
+            if (isServiceActive) {
+                val intent = Intent(this, OverlayService::class.java).apply {
+                    action = OverlayService.ACTION_CENTER_DOCK
+                }
+                startService(intent)
+            }
+            Toast.makeText(this, "Floating dock centered and visible", Toast.LENGTH_SHORT).show()
+        }
+
+        binding.btnResetDefaults.setOnClickListener {
+            val isTablet = resources.configuration.smallestScreenWidthDp >= 600
+            val defaultSens = if (isTablet) 1.6f else 1.4f
+            prefs.edit()
+                .putFloat("sensitivity", defaultSens)
+                .putFloat("scroll_sensitivity", 0.5f)
+                .putBoolean("show_dock", true)
+                .putBoolean("auto_ime_switch", true)
+                .putBoolean("three_finger_tap", true)
+                .putBoolean("haptics_enabled", true)
+                .putBoolean("start_on_boot", false)
+                .putInt("dock_x", 0)
+                .putInt("dock_y", 120)
+                .apply()
+            binding.sbSensitivity.progress = (defaultSens * 10).toInt()
+            binding.sbScrollSensitivity.progress = 5
+            syncSwitchesFromPrefs()
+            if (isServiceActive) {
+                val intent = Intent(this, OverlayService::class.java).apply {
+                    action = OverlayService.ACTION_CENTER_DOCK
+                }
+                startService(intent)
+            }
+            Toast.makeText(this, "All settings restored to defaults", Toast.LENGTH_SHORT).show()
         }
 
         binding.btnInfo.setOnClickListener {
@@ -170,7 +232,7 @@ class MainActivity : AppCompatActivity(), SharedPreferences.OnSharedPreferenceCh
                     }
                     isServiceActive = true
                     updateUiActiveState(true)
-                    Toast.makeText(this, "Virtual Mouse v1.2 Active!", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this, "Arrowroot v1.3.0 Active!", Toast.LENGTH_SHORT).show()
                 } else {
                     updateUiActiveState(false)
                     MaterialAlertDialogBuilder(this)
@@ -189,7 +251,7 @@ class MainActivity : AppCompatActivity(), SharedPreferences.OnSharedPreferenceCh
         RootMouseController.stop()
         isServiceActive = false
         updateUiActiveState(false)
-        Toast.makeText(this, "Virtual Mouse Stopped", Toast.LENGTH_SHORT).show()
+        Toast.makeText(this, "Arrowroot Stopped", Toast.LENGTH_SHORT).show()
     }
 
     private fun syncServiceState() {
@@ -200,7 +262,6 @@ class MainActivity : AppCompatActivity(), SharedPreferences.OnSharedPreferenceCh
     private fun setLoadingState(isLoading: Boolean, message: String = "") {
         if (isLoading) {
             binding.progressBarLaunch.visibility = View.VISIBLE
-            binding.tvLaunchStatus.visibility = View.VISIBLE
             binding.tvLaunchStatus.text = message
             binding.btnStartStop.isEnabled = false
             binding.btnStartStop.text = "Initializing..."
@@ -216,37 +277,52 @@ class MainActivity : AppCompatActivity(), SharedPreferences.OnSharedPreferenceCh
             RootMouseController.DriverState.DEPLOYING,
             RootMouseController.DriverState.CONNECTING -> {
                 binding.progressBarLaunch.visibility = View.VISIBLE
-                binding.tvLaunchStatus.visibility = View.VISIBLE
                 binding.tvLaunchStatus.text = message
+                binding.tvActiveModeBadge.text = "STARTING"
             }
             RootMouseController.DriverState.RUNNING -> {
                 binding.progressBarLaunch.visibility = View.GONE
-                binding.tvLaunchStatus.text = "Virtual mouse active"
                 isServiceActive = true
                 updateUiActiveState(true)
             }
             RootMouseController.DriverState.ERROR -> {
                 binding.progressBarLaunch.visibility = View.GONE
                 binding.tvLaunchStatus.text = "Error: $message"
+                binding.tvActiveModeBadge.text = "ERROR"
             }
             RootMouseController.DriverState.IDLE -> {
                 binding.progressBarLaunch.visibility = View.GONE
-                binding.tvLaunchStatus.text = "Ready to launch"
                 isServiceActive = false
                 updateUiActiveState(false)
             }
         }
     }
 
+    private fun updateModeBadge(active: Boolean, isTrackpad: Boolean, isKeyboardAuto: Boolean) {
+        if (!active) {
+            binding.tvActiveModeBadge.text = "IDLE"
+        } else if (isTrackpad) {
+            binding.tvActiveModeBadge.text = "TRACKPAD MODE"
+        } else if (isKeyboardAuto) {
+            binding.tvActiveModeBadge.text = "TOUCH • KEYBOARD"
+        } else {
+            binding.tvActiveModeBadge.text = "TOUCH MODE"
+        }
+    }
+
     private fun updateUiActiveState(active: Boolean) {
         if (active) {
-            binding.btnStartStop.text = "Stop Virtual Mouse"
-            binding.chipServiceStatus.text = "RUNNING"
+            binding.btnStartStop.text = "Stop Arrowroot"
+            binding.btnStartStop.setIconResource(R.drawable.ic_stop)
+            binding.chipServiceStatus.text = "ACTIVE"
             binding.tvLaunchStatus.text = "Hardware pointer & trackpad active"
+            updateModeBadge(true, OverlayService.isTrackpadMode, OverlayService.isKeyboardAutoPaused)
         } else {
-            binding.btnStartStop.text = "Start Virtual Mouse"
+            binding.btnStartStop.text = "Start Arrowroot"
+            binding.btnStartStop.setIconResource(R.drawable.ic_play)
             binding.chipServiceStatus.text = "STANDBY"
             binding.tvLaunchStatus.text = "Ready to launch"
+            updateModeBadge(false, false, false)
         }
     }
 
@@ -293,11 +369,13 @@ class MainActivity : AppCompatActivity(), SharedPreferences.OnSharedPreferenceCh
         binding.chipScrollSwift.setOnClickListener { binding.sbScrollSensitivity.progress = 10 }
     }
 
-    private fun updateRootStatus() {
+    private fun updateSystemDiagnostics() {
         Thread {
             val rootOk = RootMouseController.isRootAvailable()
+            val uinputOk = if (rootOk) RootMouseController.isUinputAvailable() else false
             runOnUiThread {
                 binding.tvRootStatus.text = if (rootOk) "Granted" else "Denied"
+                binding.tvUinputStatus.text = if (uinputOk) "Ready" else if (rootOk) "Missing" else "Needs Root"
             }
         }.start()
     }
@@ -320,9 +398,16 @@ class MainActivity : AppCompatActivity(), SharedPreferences.OnSharedPreferenceCh
 
     private fun showInfoDialog() {
         MaterialAlertDialogBuilder(this)
-            .setTitle("Virtual Mouse v1.2.0")
-            .setMessage("• 1-Finger Hold + 2nd-Finger Drag: Hold 1 finger stationary and drag with a 2nd finger to hold Left Click and drag items/text.\n• 3-Finger Tap: Instantly swap between Trackpad and Touch mode anytime.\n• Auto-Keyboard: Automatically switches to Touch mode when the keyboard opens, and restores Trackpad when done.\n• Hide Overlay: Tap ✕ on the dock or toggle in Home/Settings.")
-            .setPositiveButton("Close", null)
+            .setTitle("Arrowroot v1.3.0")
+            .setMessage(
+                "Arrowroot transforms your rooted Android screen into a zero-latency hardware trackpad using Linux /dev/uinput and EVIOCGRAB.\n\n" +
+                "• 1-Finger Hold + 2nd-Finger Drag: Hold 1 finger stationary to lock Left Click, and slide a 2nd finger to drag items or select text.\n" +
+                "• 2-Finger Tap & Glide: Tap 2 fingers for Right Click; slide 2 fingers together for smooth hi-res wheel scrolling.\n" +
+                "• 3-Finger Tap: Instantly swap between Trackpad and Direct Touch mode anytime.\n" +
+                "• Smart Keyboard Auto-Touch: Automatically pauses trackpad capture when the keyboard appears.\n" +
+                "• Dock Controls: Drag the left grip to reposition, or double-tap the grip to snap back to center."
+            )
+            .setPositiveButton("Got It", null)
             .show()
     }
 }

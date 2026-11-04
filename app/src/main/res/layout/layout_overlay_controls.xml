@@ -1,39 +1,54 @@
 <?xml version="1.0" encoding="utf-8"?>
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="wrap_content"
     android:layout_height="wrap_content"
     android:orientation="horizontal"
     android:background="@drawable/bg_floating_pill"
-    android:padding="6dp"
+    android:paddingStart="8dp"
+    android:paddingEnd="8dp"
+    android:paddingTop="6dp"
+    android:paddingBottom="6dp"
+    android:elevation="12dp"
     android:gravity="center_vertical">
 
-    <!-- Drag Handle -->
-    <View
+    <!-- Drag Grip (0..10% of dock width: 8 + 18 + 6 = 32dp) -->
+    <FrameLayout
         android:id="@+id/drag_handle"
-        android:layout_width="12dp"
-        android:layout_height="28dp"
-        android:layout_marginStart="4dp"
-        android:layout_marginEnd="6dp"
-        android:background="#64748B" />
-
-    <!-- Left Click Button -->
-    <Button
-        android:id="@+id/btn_left_click"
-        android:layout_width="58dp"
+        android:layout_width="18dp"
         android:layout_height="44dp"
-        android:text="L"
-        android:textStyle="bold"
-        android:textColor="#FFFFFF"
-        android:backgroundTint="#3B82F6"
+        android:layout_marginEnd="6dp"
+        android:contentDescription="Drag or double-tap to center">
+
+        <View
+            android:layout_width="5dp"
+            android:layout_height="24dp"
+            android:layout_gravity="center"
+            android:background="@drawable/bg_drag_grip" />
+    </FrameLayout>
+
+    <!-- Left Click Button (10..33% of dock width: +66 + 6 = 104dp) -->
+    <com.google.android.material.button.MaterialButton
+        android:id="@+id/btn_left_click"
+        android:layout_width="66dp"
+        android:layout_height="44dp"
+        android:layout_marginEnd="6dp"
         android:insetTop="0dp"
         android:insetBottom="0dp"
-        android:layout_marginEnd="6dp" />
+        android:padding="0dp"
+        android:text="L"
+        android:textColor="#FFFFFF"
+        android:textSize="14sp"
+        android:textStyle="bold"
+        app:backgroundTint="#3B82F6"
+        app:cornerRadius="16dp" />
 
-    <!-- Mode Toggle Button -->
+    <!-- Mode Toggle Capsule (33..62% of dock width: +86 + 6 = 196dp) -->
     <LinearLayout
         android:id="@+id/btn_toggle_mode"
-        android:layout_width="76dp"
+        android:layout_width="86dp"
         android:layout_height="44dp"
+        android:layout_marginEnd="6dp"
         android:orientation="vertical"
         android:gravity="center"
         android:background="@drawable/bg_floating_button"
@@ -43,44 +58,49 @@
         <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="MODE"
-            android:textSize="8sp"
+            android:text="ARROWROOT"
+            android:letterSpacing="0.06"
+            android:textSize="7.5sp"
+            android:textStyle="bold"
             android:textColor="#94A3B8" />
 
         <TextView
             android:id="@+id/tv_mode_status"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
+            android:layout_marginTop="1dp"
             android:text="TRACKPAD"
             android:textStyle="bold"
             android:textSize="11sp"
             android:textColor="#10B981" />
     </LinearLayout>
 
-    <!-- Right Click Button -->
-    <Button
+    <!-- Right Click Button (62..84% of dock width: +64 + 6 = 266dp) -->
+    <com.google.android.material.button.MaterialButton
         android:id="@+id/btn_right_click"
-        android:layout_width="58dp"
+        android:layout_width="64dp"
         android:layout_height="44dp"
-        android:text="R"
-        android:textStyle="bold"
-        android:textColor="#FFFFFF"
-        android:backgroundTint="#6366F1"
+        android:layout_marginEnd="6dp"
         android:insetTop="0dp"
         android:insetBottom="0dp"
-        android:layout_marginStart="6dp" />
+        android:padding="0dp"
+        android:text="R"
+        android:textColor="#FFFFFF"
+        android:textSize="14sp"
+        android:textStyle="bold"
+        app:backgroundTint="#6366F1"
+        app:cornerRadius="16dp" />
 
-    <!-- Hide Overlay Button -->
+    <!-- Hide Overlay Button (84..100% of dock width: +42 + 8 = 316dp) -->
     <TextView
         android:id="@+id/btn_hide_dock"
-        android:layout_width="40dp"
+        android:layout_width="42dp"
         android:layout_height="44dp"
-        android:layout_marginStart="6dp"
         android:gravity="center"
         android:background="@drawable/bg_floating_button"
         android:text="✕"
-        android:textColor="#94A3B8"
-        android:textSize="14sp"
+        android:textColor="#CBD5E1"
+        android:textSize="13sp"
         android:textStyle="bold"
         android:clickable="true"
         android:focusable="true" />

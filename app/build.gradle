@@ -4,6 +4,8 @@ plugins {
 }
 
 def runNumber = System.getenv("GITHUB_RUN_NUMBER") ? System.getenv("GITHUB_RUN_NUMBER").toInteger() : 1
+def ksPass = System.getenv("KEYSTORE_PASSWORD") ?: "vmouse123"
+def kPass = System.getenv("KEY_PASSWORD") ?: ksPass
 
 android {
     namespace 'com.virtualmouse.app'
@@ -14,8 +16,8 @@ android {
         applicationId "com.virtualmouse.app"
         minSdk 26
         targetSdk 34
-        versionCode 10 + runNumber
-        versionName "1.2.0"
+        versionCode 30 + runNumber
+        versionName "1.3.0"
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
 
@@ -34,9 +36,9 @@ android {
     signingConfigs {
         releaseConfig {
             storeFile file("vmouse.keystore")
-            storePassword "vmouse123"
+            storePassword ksPass
             keyAlias "vmouse_key"
-            keyPassword "vmouse123"
+            keyPassword kPass
             enableV1Signing true
             enableV2Signing true
         }

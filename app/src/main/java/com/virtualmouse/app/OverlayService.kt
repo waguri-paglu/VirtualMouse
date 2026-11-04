@@ -17,6 +17,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.SystemClock
 import android.provider.Settings
 import android.service.quicksettings.Tile
 import android.service.quicksettings.TileService
@@ -34,11 +35,12 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import androidx.preference.PreferenceManager
+import kotlin.math.abs
 
 /**
- * Virtual Mouse v1.2.0 Foreground Service:
- * - Hosts the floating controls dock (with Hide button)
- * - Hosts a 1px invisible IME sensor window that automatically switches to Touch Mode
+ * Arrowroot v1.3.0 Foreground Service:
+ * - Hosts the floating controls dock (with persistent position, bounds clamping, and double-tap recenter)
+ * - Hosts the 1px invisible IME sensor window that automatically switches to Touch Mode
  *   when the soft keyboard appears, and restores Trackpad Mode when the keyboard closes.
  */
 class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeListener {
@@ -66,10 +68,16 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
     private var screenRotation: Int = Surface.ROTATION_0
 
     companion object {
-        const val CHANNEL_ID = "vmouse_service_channel"
+        const val CHANNEL_ID = "arrowroot_service_channel"
         const val NOTIFICATION_ID = 1001
         const val ACTION_STOP = "com.virtualmouse.app.ACTION_STOP"
         const val ACTION_TOGGLE_DOCK = "com.virtualmouse.app.ACTION_TOGGLE_DOCK"
+        const val ACTION_SWAP_MODE = "com.virtualmouse.app.ACTION_SWAP_MODE"
+        const val ACTION_CENTER_DOCK = "com.virtualmouse.app.ACTION_CENTER_DOCK"
+
+        @Volatile var isTrackpadMode: Boolean = true
+        @Volatile var isKeyboardAutoPaused: Boolean = false
+        var onModeChanged: ((Boolean, Boolean) -> Unit)? = null
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -105,17 +113,18 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
                 when (eventCode) {
                     0 -> { // CB_MODE_TOUCH
                         isTrackpadActive = false
-                        updateDockUiState(false)
+                        updateDockUiState(false, isKeyboardAuto = pausedByKeyboard)
                     }
                     1 -> { // CB_MODE_TRACKPAD
                         isTrackpadActive = true
+                        pausedByKeyboard = false
                         updateDockUiState(true)
                     }
-                    2 -> { // CB_HIDE_OVERLAY (Hide button tapped on dock while in Trackpad mode)
+                    2 -> { // CB_HIDE_OVERLAY
                         prefs.edit().putBoolean("show_dock", false).apply()
                         Toast.makeText(
                             this,
-                            "Buttons hidden. 3-finger tap swaps mode; use notification or app to restore.",
+                            "Dock hidden. 3-finger tap swaps mode; use notification or Arrowroot to restore.",
                             Toast.LENGTH_SHORT
                         ).show()
                     }
@@ -124,6 +133,7 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
         }
 
         initFloatingControls()
+        initImeSensorWindow()
         VirtualMouseTileService.requestSync(this)
 
         RootMouseController.startAsync(this) { success, _ ->
@@ -133,8 +143,9 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
                 mainHandler.postDelayed({
                     syncDaemonConfigAndBounds()
                     RootMouseController.setTouchGrab(true)
+                    updateDockUiState(true)
                     VirtualMouseTileService.requestSync(this)
-                }, 180L)
+                }, 160L)
             }
         }
     }
@@ -176,9 +187,10 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
     /**
      * Invisible 1px edge sensor window with FLAG_NOT_FOCUSABLE | FLAG_ALT_FOCUSABLE_IM
      * and SOFT_INPUT_ADJUST_RESIZE so Android WindowManager notifies us immediately
-     * whenever the soft keyboard (IME) opens or closes in ANY app!
+     * whenever the soft keyboard (IME) opens or closes in any app.
      */
     private fun initImeSensorWindow() {
+        if (imeSensorView != null) return
         val sensor = View(this).apply {
             setBackgroundColor(Color.TRANSPARENT)
         }
@@ -236,7 +248,6 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
         if (!autoKeyboardSwitch) return
 
         if (visible) {
-            // Soft keyboard appeared -> automatically switch to Touch mode so user can type!
             if (isTrackpadActive) {
                 pausedByKeyboard = true
                 isTrackpadActive = false
@@ -244,7 +255,6 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
                 updateDockUiState(false, isKeyboardAuto = true)
             }
         } else {
-            // Soft keyboard closed -> automatically switch back to Trackpad mode!
             if (pausedByKeyboard) {
                 pausedByKeyboard = false
                 mainHandler.postDelayed({
@@ -256,6 +266,40 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
                     }
                 }, 160L)
             }
+        }
+    }
+
+    private fun clampDockCoordinates() {
+        val maxX = (screenWidth / 2) - 40
+        val maxY = (screenHeight - 160).coerceAtLeast(120)
+        controlsLayoutParams.x = controlsLayoutParams.x.coerceIn(-maxX, maxX)
+        controlsLayoutParams.y = controlsLayoutParams.y.coerceIn(24, maxY)
+    }
+
+    private fun centerDockPosition() {
+        controlsLayoutParams.x = 0
+        controlsLayoutParams.y = 120
+        prefs.edit().putInt("dock_x", 0).putInt("dock_y", 120).apply()
+        controlsView?.let {
+            try {
+                windowManager.updateViewLayout(it, controlsLayoutParams)
+            } catch (ignored: Exception) {}
+            it.post { syncDaemonConfigAndBounds() }
+        }
+    }
+
+    private fun toggleTrackpadModeManual() {
+        pausedByKeyboard = false
+        val targetGrab = !isTrackpadActive
+        isTrackpadActive = targetGrab
+        updateDockUiState(targetGrab)
+        if (targetGrab) {
+            mainHandler.postDelayed({
+                syncDaemonConfigAndBounds()
+                RootMouseController.setTouchGrab(true)
+            }, 140L)
+        } else {
+            RootMouseController.setTouchGrab(false)
         }
     }
 
@@ -287,7 +331,14 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
 
     override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
         super.onConfigurationChanged(newConfig)
-        mainHandler.postDelayed({ syncDaemonConfigAndBounds() }, 100L)
+        mainHandler.postDelayed({
+            updateScreenMetrics()
+            clampDockCoordinates()
+            controlsView?.let {
+                try { windowManager.updateViewLayout(it, controlsLayoutParams) } catch (ignored: Exception) {}
+            }
+            syncDaemonConfigAndBounds()
+        }, 100L)
     }
 
     override fun onSharedPreferenceChanged(sharedPreferences: SharedPreferences?, key: String?) {
@@ -335,8 +386,10 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
-            y = 120
+            x = prefs.getInt("dock_x", 0)
+            y = prefs.getInt("dock_y", 120)
         }
+        clampDockCoordinates()
 
         val btnLeftClick = controlsView?.findViewById<View>(R.id.btn_left_click)
         val btnRightClick = controlsView?.findViewById<View>(R.id.btn_right_click)
@@ -366,18 +419,7 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
 
         btnToggle?.setOnClickListener { v ->
             if (hapticsEnabled) v.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
-            pausedByKeyboard = false
-            val targetGrab = !isTrackpadActive
-            isTrackpadActive = targetGrab
-            updateDockUiState(targetGrab)
-            if (targetGrab) {
-                mainHandler.postDelayed({
-                    syncDaemonConfigAndBounds()
-                    RootMouseController.setTouchGrab(true)
-                }, 150L)
-            } else {
-                RootMouseController.setTouchGrab(false)
-            }
+            toggleTrackpadModeManual()
         }
 
         btnHideDock?.setOnClickListener { v ->
@@ -385,7 +427,7 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
             prefs.edit().putBoolean("show_dock", false).apply()
             Toast.makeText(
                 this,
-                "Buttons hidden. 3-finger tap swaps mode; use notification or app to restore.",
+                "Dock hidden. 3-finger tap swaps mode; use notification or Arrowroot to restore.",
                 Toast.LENGTH_SHORT
             ).show()
         }
@@ -395,6 +437,7 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
             private var initialY = 0
             private var initialTouchX = 0f
             private var initialTouchY = 0f
+            private var lastTapMs = 0L
 
             override fun onTouch(v: View, event: MotionEvent): Boolean {
                 when (event.actionMasked) {
@@ -408,12 +451,27 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
                     MotionEvent.ACTION_MOVE -> {
                         controlsLayoutParams.x = initialX + (event.rawX - initialTouchX).toInt()
                         controlsLayoutParams.y = initialY - (event.rawY - initialTouchY).toInt()
+                        clampDockCoordinates()
                         windowManager.updateViewLayout(controlsView, controlsLayoutParams)
                         syncDaemonConfigAndBounds()
                         return true
                     }
                     MotionEvent.ACTION_UP -> {
-                        syncDaemonConfigAndBounds()
+                        val moved = abs(event.rawX - initialTouchX) + abs(event.rawY - initialTouchY)
+                        val now = SystemClock.uptimeMillis()
+                        if (moved < 18f && now - lastTapMs < 320L) {
+                            if (hapticsEnabled) v.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+                            centerDockPosition()
+                            Toast.makeText(this@OverlayService, "Dock centered", Toast.LENGTH_SHORT).show()
+                            lastTapMs = 0L
+                        } else {
+                            if (moved < 18f) lastTapMs = now
+                            prefs.edit()
+                                .putInt("dock_x", controlsLayoutParams.x)
+                                .putInt("dock_y", controlsLayoutParams.y)
+                                .apply()
+                            syncDaemonConfigAndBounds()
+                        }
                         return true
                     }
                 }
@@ -428,6 +486,10 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
     }
 
     private fun updateDockUiState(grabbed: Boolean, isKeyboardAuto: Boolean = false) {
+        isTrackpadMode = grabbed
+        isKeyboardAutoPaused = isKeyboardAuto
+        onModeChanged?.invoke(grabbed, isKeyboardAuto)
+
         val tvStatus = controlsView?.findViewById<TextView>(R.id.tv_mode_status)
         if (hapticsEnabled) {
             controlsView?.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
@@ -436,8 +498,8 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
             tvStatus?.text = "TRACKPAD"
             tvStatus?.setTextColor(0xFF10B981.toInt())
         } else {
-            tvStatus?.text = if (isKeyboardAuto) "TOUCH (KB)" else "TOUCH"
-            tvStatus?.setTextColor(0xFF38BDF8.toInt())
+            tvStatus?.text = if (isKeyboardAuto) "TOUCH • KB" else "TOUCH"
+            tvStatus?.setTextColor(if (isKeyboardAuto) 0xFFF59E0B.toInt() else 0xFF38BDF8.toInt())
         }
         VirtualMouseTileService.requestSync(this)
     }
@@ -446,10 +508,10 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
                 CHANNEL_ID,
-                "Virtual Mouse Service",
+                "Arrowroot Pointer Service",
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
-                description = "Keeps virtual trackpad and mouse active"
+                description = "Keeps Arrowroot hardware pointer and trackpad active"
             }
             val manager = getSystemService(NotificationManager::class.java)
             manager.createNotificationChannel(channel)
@@ -460,6 +522,14 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
         val appIntent = Intent(this, MainActivity::class.java)
         val pendingIntent = PendingIntent.getActivity(
             this, 0, appIntent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
+        val swapModeIntent = Intent(this, OverlayService::class.java).apply {
+            action = ACTION_SWAP_MODE
+        }
+        val swapModePending = PendingIntent.getService(
+            this, 3, swapModeIntent,
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
@@ -479,13 +549,14 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
             PendingIntent.FLAG_IMMUTABLE
         )
 
-        val dockActionLabel = if (showFloatingDock) "Hide Buttons" else "Show Buttons"
+        val dockActionLabel = if (showFloatingDock) "Hide Dock" else "Show Dock"
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("Virtual Mouse v1.2 Active")
+            .setContentTitle("Arrowroot v1.3.0 Active")
             .setContentText("3-finger tap swaps mode • Auto-keyboard touch enabled")
             .setSmallIcon(R.drawable.ic_mouse)
             .setContentIntent(pendingIntent)
+            .addAction(R.drawable.ic_swap, "Swap Mode", swapModePending)
             .addAction(R.drawable.ic_mouse, dockActionLabel, toggleDockPending)
             .addAction(R.drawable.ic_toggle, "Stop", stopPendingIntent)
             .setOngoing(true)
@@ -502,6 +573,12 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
                 val next = !prefs.getBoolean("show_dock", true)
                 prefs.edit().putBoolean("show_dock", next).apply()
             }
+            ACTION_SWAP_MODE -> {
+                toggleTrackpadModeManual()
+            }
+            ACTION_CENTER_DOCK -> {
+                centerDockPosition()
+            }
         }
         return START_STICKY
     }
@@ -514,15 +591,18 @@ class OverlayService : Service(), SharedPreferences.OnSharedPreferenceChangeList
         controlsView?.let {
             try { windowManager.removeView(it) } catch (ignored: Exception) {}
         }
+        controlsView = null
+        imeSensorView?.let {
+            try { windowManager.removeView(it) } catch (ignored: Exception) {}
+        }
+        imeSensorView = null
         RootMouseController.stop()
         VirtualMouseTileService.requestSync(this)
     }
 }
 
 /**
- * Quick Settings (QS) Tile to start and stop the Virtual Mouse in a single tap.
- * - Tapping when OFF -> Starts Virtual Mouse & turns Tile ON (Active)
- * - Tapping when ON  -> Stops Virtual Mouse & turns Tile OFF (Inactive)
+ * Quick Settings (QS) Tile to start and stop Arrowroot in a single tap.
  */
 class VirtualMouseTileService : TileService() {
 
@@ -581,13 +661,13 @@ class VirtualMouseTileService : TileService() {
                     } else {
                         startService(serviceIntent)
                     }
-                    updateTileUi(active = true, subtitleText = "Active")
+                    updateTileUi(active = true, subtitleText = "Trackpad")
                 } else {
                     updateTileUi(active = false, subtitleText = "Error")
                     Handler(Looper.getMainLooper()).post {
                         Toast.makeText(
                             this,
-                            errorMsg ?: "Failed to start Virtual Mouse (check root)",
+                            errorMsg ?: "Failed to start Arrowroot (check root)",
                             Toast.LENGTH_SHORT
                         ).show()
                     }
@@ -598,13 +678,20 @@ class VirtualMouseTileService : TileService() {
 
     private fun syncTileState() {
         val active = RootMouseController.isAttached()
-        updateTileUi(active = active, subtitleText = if (active) "Active" else "Off")
+        val sub = if (!active) {
+            "Off"
+        } else if (OverlayService.isTrackpadMode) {
+            "Trackpad"
+        } else {
+            "Touch"
+        }
+        updateTileUi(active = active, subtitleText = sub)
     }
 
     private fun updateTileUi(active: Boolean, subtitleText: String) {
         val tile = qsTile ?: return
         tile.state = if (active) Tile.STATE_ACTIVE else Tile.STATE_INACTIVE
-        tile.label = "Virtual Mouse"
+        tile.label = "Arrowroot"
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             tile.subtitle = subtitleText
         }

@@ -5,7 +5,7 @@
     android:layout_height="match_parent"
     android:background="?attr/colorSurface">
 
-    <!-- Minimalist Google Pixel / Play Store Top App Bar -->
+    <!-- Top App Bar -->
     <com.google.android.material.appbar.AppBarLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
@@ -15,7 +15,7 @@
         <com.google.android.material.appbar.MaterialToolbar
             android:id="@+id/topAppBar"
             android:layout_width="match_parent"
-            android:layout_height="64dp"
+            android:layout_height="68dp"
             android:paddingStart="16dp"
             android:paddingEnd="16dp">
 
@@ -26,15 +26,15 @@
                 android:orientation="horizontal">
 
                 <ImageView
-                    android:layout_width="28dp"
-                    android:layout_height="28dp"
-                    android:src="@drawable/ic_mouse"
-                    app:tint="?attr/colorPrimary" />
+                    android:layout_width="38dp"
+                    android:layout_height="38dp"
+                    android:src="@mipmap/ic_launcher_round"
+                    android:contentDescription="@string/app_name" />
 
                 <LinearLayout
                     android:layout_width="0dp"
                     android:layout_height="wrap_content"
-                    android:layout_marginStart="14dp"
+                    android:layout_marginStart="12dp"
                     android:layout_weight="1"
                     android:orientation="vertical">
 
@@ -42,15 +42,16 @@
                         android:id="@+id/tv_page_title"
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
-                        android:text="Virtual Mouse"
+                        android:text="Arrowroot"
                         android:textColor="?attr/colorOnSurface"
                         android:textSize="20sp"
                         android:textStyle="bold" />
 
                     <TextView
+                        android:id="@+id/tv_page_subtitle"
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
-                        android:text="v1.2 • Kernel uinput &amp; EVIOCGRAB"
+                        android:text="v1.3.0 • Kernel uinput &amp; EVIOCGRAB"
                         android:textColor="?attr/colorOnSurfaceVariant"
                         android:textSize="11sp" />
                 </LinearLayout>
@@ -60,16 +61,19 @@
                     style="@style/Widget.Material3.Chip.Assist"
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
+                    android:clickable="false"
                     android:text="STANDBY"
                     android:textSize="11sp"
+                    android:textStyle="bold"
                     app:chipCornerRadius="16dp" />
 
                 <ImageButton
                     android:id="@+id/btn_info"
                     android:layout_width="40dp"
                     android:layout_height="40dp"
-                    android:layout_marginStart="6dp"
+                    android:layout_marginStart="4dp"
                     android:background="?attr/selectableItemBackgroundBorderless"
+                    android:contentDescription="About Arrowroot"
                     android:src="@android:drawable/ic_menu_info_details"
                     app:tint="?attr/colorOnSurfaceVariant" />
 
@@ -77,7 +81,7 @@
         </com.google.android.material.appbar.MaterialToolbar>
     </com.google.android.material.appbar.AppBarLayout>
 
-    <!-- Main Content Area (Switches cleanly between Page 1: Home and Page 2: Settings) -->
+    <!-- Main Scrollable Content -->
     <androidx.core.widget.NestedScrollView
         android:layout_width="match_parent"
         android:layout_height="match_parent"
@@ -91,10 +95,10 @@
             android:paddingStart="16dp"
             android:paddingEnd="16dp"
             android:paddingTop="8dp"
-            android:paddingBottom="24dp">
+            android:paddingBottom="28dp">
 
             <!-- ============================================================
-                 TAB 1: MINIMALISTIC PIXEL HOME PAGE
+                 TAB 1: HOME DASHBOARD
                  ============================================================ -->
             <LinearLayout
                 android:id="@+id/page_home"
@@ -103,7 +107,7 @@
                 android:orientation="vertical"
                 android:visibility="visible">
 
-                <!-- Monet Hero Launch Card -->
+                <!-- Hero Engine Control Card -->
                 <com.google.android.material.card.MaterialCardView
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
@@ -116,17 +120,39 @@
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
                         android:orientation="vertical"
-                        android:padding="24dp">
+                        android:padding="22dp">
 
-                        <TextView
-                            android:layout_width="wrap_content"
+                        <LinearLayout
+                            android:layout_width="match_parent"
                             android:layout_height="wrap_content"
-                            android:text="SYSTEM POINTER ENGINE"
-                            android:textColor="?attr/colorOnSecondaryContainer"
-                            android:alpha="0.75"
-                            android:textSize="11sp"
-                            android:textStyle="bold"
-                            android:letterSpacing="0.08" />
+                            android:gravity="center_vertical"
+                            android:orientation="horizontal">
+
+                            <TextView
+                                android:layout_width="0dp"
+                                android:layout_height="wrap_content"
+                                android:layout_weight="1"
+                                android:alpha="0.75"
+                                android:letterSpacing="0.08"
+                                android:text="KERNEL POINTER ENGINE"
+                                android:textColor="?attr/colorOnSecondaryContainer"
+                                android:textSize="11sp"
+                                android:textStyle="bold" />
+
+                            <TextView
+                                android:id="@+id/tv_active_mode_badge"
+                                android:layout_width="wrap_content"
+                                android:layout_height="wrap_content"
+                                android:background="@drawable/bg_icon_badge"
+                                android:paddingStart="10dp"
+                                android:paddingTop="4dp"
+                                android:paddingEnd="10dp"
+                                android:paddingBottom="4dp"
+                                android:text="IDLE"
+                                android:textColor="?attr/colorPrimary"
+                                android:textSize="10sp"
+                                android:textStyle="bold" />
+                        </LinearLayout>
 
                         <TextView
                             android:id="@+id/tv_launch_status"
@@ -135,14 +161,24 @@
                             android:layout_marginTop="6dp"
                             android:text="Ready to launch"
                             android:textColor="?attr/colorOnSecondaryContainer"
-                            android:textSize="20sp"
+                            android:textSize="21sp"
                             android:textStyle="bold" />
+
+                        <TextView
+                            android:id="@+id/tv_launch_substatus"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:layout_marginTop="2dp"
+                            android:alpha="0.8"
+                            android:text="Zero-latency /dev/uinput mouse with EVIOCGRAB trackpad capture"
+                            android:textColor="?attr/colorOnSecondaryContainer"
+                            android:textSize="12sp" />
 
                         <com.google.android.material.progressindicator.LinearProgressIndicator
                             android:id="@+id/progress_bar_launch"
                             android:layout_width="match_parent"
                             android:layout_height="wrap_content"
-                            android:layout_marginTop="16dp"
+                            android:layout_marginTop="14dp"
                             android:indeterminate="true"
                             android:visibility="gone"
                             app:indicatorColor="?attr/colorPrimary"
@@ -152,21 +188,62 @@
                         <com.google.android.material.button.MaterialButton
                             android:id="@+id/btn_start_stop"
                             android:layout_width="match_parent"
-                            android:layout_height="58dp"
-                            android:layout_marginTop="20dp"
-                            android:text="Start Virtual Mouse"
+                            android:layout_height="56dp"
+                            android:layout_marginTop="18dp"
+                            android:text="Start Arrowroot"
                             android:textSize="16sp"
                             android:textStyle="bold"
-                            app:cornerRadius="29dp" />
+                            app:cornerRadius="28dp"
+                            app:icon="@drawable/ic_play"
+                            app:iconGravity="textStart"
+                            app:iconPadding="10dp" />
+
+                        <!-- Quick Actions Row -->
+                        <LinearLayout
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:layout_marginTop="10dp"
+                            android:orientation="horizontal">
+
+                            <com.google.android.material.button.MaterialButton
+                                android:id="@+id/btn_quick_swap_mode"
+                                style="@style/Widget.Material3.Button.TonalButton"
+                                android:layout_width="0dp"
+                                android:layout_height="44dp"
+                                android:layout_marginEnd="6dp"
+                                android:layout_weight="1"
+                                android:text="Swap Mode"
+                                android:textSize="12sp"
+                                android:textStyle="bold"
+                                app:cornerRadius="22dp"
+                                app:icon="@drawable/ic_swap"
+                                app:iconGravity="textStart"
+                                app:iconSize="16dp" />
+
+                            <com.google.android.material.button.MaterialButton
+                                android:id="@+id/btn_reset_dock"
+                                style="@style/Widget.Material3.Button.TonalButton"
+                                android:layout_width="0dp"
+                                android:layout_height="44dp"
+                                android:layout_marginStart="6dp"
+                                android:layout_weight="1"
+                                android:text="Center Dock"
+                                android:textSize="12sp"
+                                android:textStyle="bold"
+                                app:cornerRadius="22dp"
+                                app:icon="@drawable/ic_reset"
+                                app:iconGravity="textStart"
+                                app:iconSize="16dp" />
+                        </LinearLayout>
 
                     </LinearLayout>
                 </com.google.android.material.card.MaterialCardView>
 
-                <!-- Quick Readiness & Overlay Toggle Card -->
+                <!-- System Diagnostics & Floating Dock Card -->
                 <com.google.android.material.card.MaterialCardView
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:layout_marginTop="16dp"
+                    android:layout_marginTop="14dp"
                     app:cardBackgroundColor="?attr/colorSurfaceVariant"
                     app:cardCornerRadius="24dp"
                     app:cardElevation="0dp"
@@ -177,6 +254,133 @@
                         android:layout_height="wrap_content"
                         android:orientation="vertical"
                         android:padding="20dp">
+
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:letterSpacing="0.06"
+                            android:text="SYSTEM DIAGNOSTICS"
+                            android:textColor="?attr/colorPrimary"
+                            android:textSize="11sp"
+                            android:textStyle="bold" />
+
+                        <!-- 3-Column Readiness Grid -->
+                        <LinearLayout
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:layout_marginTop="12dp"
+                            android:baselineAligned="false"
+                            android:orientation="horizontal">
+
+                            <!-- Col 1: Root -->
+                            <LinearLayout
+                                android:layout_width="0dp"
+                                android:layout_height="wrap_content"
+                                android:layout_marginEnd="6dp"
+                                android:layout_weight="1"
+                                android:background="@drawable/bg_icon_badge"
+                                android:gravity="center"
+                                android:orientation="vertical"
+                                android:paddingTop="12dp"
+                                android:paddingBottom="12dp">
+
+                                <TextView
+                                    android:layout_width="wrap_content"
+                                    android:layout_height="wrap_content"
+                                    android:text="Superuser"
+                                    android:textColor="?attr/colorOnSurfaceVariant"
+                                    android:textSize="11sp" />
+
+                                <TextView
+                                    android:id="@+id/tv_root_status"
+                                    android:layout_width="wrap_content"
+                                    android:layout_height="wrap_content"
+                                    android:layout_marginTop="3dp"
+                                    android:text="Checking..."
+                                    android:textColor="?attr/colorPrimary"
+                                    android:textSize="13sp"
+                                    android:textStyle="bold" />
+                            </LinearLayout>
+
+                            <!-- Col 2: /dev/uinput -->
+                            <LinearLayout
+                                android:layout_width="0dp"
+                                android:layout_height="wrap_content"
+                                android:layout_marginStart="3dp"
+                                android:layout_marginEnd="3dp"
+                                android:layout_weight="1"
+                                android:background="@drawable/bg_icon_badge"
+                                android:gravity="center"
+                                android:orientation="vertical"
+                                android:paddingTop="12dp"
+                                android:paddingBottom="12dp">
+
+                                <TextView
+                                    android:layout_width="wrap_content"
+                                    android:layout_height="wrap_content"
+                                    android:text="Kernel uinput"
+                                    android:textColor="?attr/colorOnSurfaceVariant"
+                                    android:textSize="11sp" />
+
+                                <TextView
+                                    android:id="@+id/tv_uinput_status"
+                                    android:layout_width="wrap_content"
+                                    android:layout_height="wrap_content"
+                                    android:layout_marginTop="3dp"
+                                    android:text="Checking..."
+                                    android:textColor="?attr/colorPrimary"
+                                    android:textSize="13sp"
+                                    android:textStyle="bold" />
+                            </LinearLayout>
+
+                            <!-- Col 3: Overlay -->
+                            <LinearLayout
+                                android:layout_width="0dp"
+                                android:layout_height="wrap_content"
+                                android:layout_marginStart="6dp"
+                                android:layout_weight="1"
+                                android:background="@drawable/bg_icon_badge"
+                                android:gravity="center"
+                                android:orientation="vertical"
+                                android:paddingTop="12dp"
+                                android:paddingBottom="12dp">
+
+                                <TextView
+                                    android:layout_width="wrap_content"
+                                    android:layout_height="wrap_content"
+                                    android:text="Overlay"
+                                    android:textColor="?attr/colorOnSurfaceVariant"
+                                    android:textSize="11sp" />
+
+                                <TextView
+                                    android:id="@+id/tv_overlay_status"
+                                    android:layout_width="wrap_content"
+                                    android:layout_height="wrap_content"
+                                    android:layout_marginTop="3dp"
+                                    android:text="Checking..."
+                                    android:textColor="?attr/colorPrimary"
+                                    android:textSize="13sp"
+                                    android:textStyle="bold" />
+                            </LinearLayout>
+                        </LinearLayout>
+
+                        <com.google.android.material.button.MaterialButton
+                            android:id="@+id/btn_grant_overlay"
+                            style="@style/Widget.Material3.Button.TonalButton"
+                            android:layout_width="match_parent"
+                            android:layout_height="48dp"
+                            android:layout_marginTop="12dp"
+                            android:text="Grant Overlay Permission"
+                            android:visibility="gone"
+                            app:cornerRadius="24dp" />
+
+                        <View
+                            android:layout_width="match_parent"
+                            android:layout_height="1dp"
+                            android:layout_marginTop="16dp"
+                            android:layout_marginBottom="14dp"
+                            android:alpha="0.15"
+                            android:background="?attr/colorOnSurfaceVariant" />
 
                         <!-- Floating Buttons Quick Toggle -->
                         <LinearLayout
@@ -194,7 +398,7 @@
                                 <TextView
                                     android:layout_width="wrap_content"
                                     android:layout_height="wrap_content"
-                                    android:text="Floating Mouse Buttons"
+                                    android:text="Floating Mouse Dock"
                                     android:textColor="?attr/colorOnSurface"
                                     android:textSize="15sp"
                                     android:textStyle="bold" />
@@ -202,7 +406,7 @@
                                 <TextView
                                     android:layout_width="wrap_content"
                                     android:layout_height="wrap_content"
-                                    android:text="Show L / MODE / R dock on screen"
+                                    android:text="Pin L / MODE / R / Hide pill on screen (double-tap grip to center)"
                                     android:textColor="?attr/colorOnSurfaceVariant"
                                     android:textSize="12sp" />
                             </LinearLayout>
@@ -214,75 +418,14 @@
                                 android:checked="true" />
                         </LinearLayout>
 
-                        <View
-                            android:layout_width="match_parent"
-                            android:layout_height="1dp"
-                            android:layout_marginTop="14dp"
-                            android:layout_marginBottom="14dp"
-                            android:alpha="0.15"
-                            android:background="?attr/colorOnSurfaceVariant" />
-
-                        <!-- Compact Diagnostics Row -->
-                        <LinearLayout
-                            android:layout_width="match_parent"
-                            android:layout_height="wrap_content"
-                            android:gravity="center_vertical"
-                            android:orientation="horizontal">
-
-                            <TextView
-                                android:layout_width="0dp"
-                                android:layout_height="wrap_content"
-                                android:layout_weight="1"
-                                android:text="Root Access"
-                                android:textColor="?attr/colorOnSurfaceVariant"
-                                android:textSize="13sp" />
-
-                            <TextView
-                                android:id="@+id/tv_root_status"
-                                android:layout_width="wrap_content"
-                                android:layout_height="wrap_content"
-                                android:text="Checking..."
-                                android:textColor="?attr/colorPrimary"
-                                android:textSize="13sp"
-                                android:textStyle="bold" />
-
-                            <TextView
-                                android:layout_width="wrap_content"
-                                android:layout_height="wrap_content"
-                                android:layout_marginStart="16dp"
-                                android:layout_marginEnd="8dp"
-                                android:text="•  Overlay"
-                                android:textColor="?attr/colorOnSurfaceVariant"
-                                android:textSize="13sp" />
-
-                            <TextView
-                                android:id="@+id/tv_overlay_status"
-                                android:layout_width="wrap_content"
-                                android:layout_height="wrap_content"
-                                android:text="Checking..."
-                                android:textColor="?attr/colorPrimary"
-                                android:textSize="13sp"
-                                android:textStyle="bold" />
-                        </LinearLayout>
-
-                        <com.google.android.material.button.MaterialButton
-                            android:id="@+id/btn_grant_overlay"
-                            style="@style/Widget.Material3.Button.TonalButton"
-                            android:layout_width="match_parent"
-                            android:layout_height="48dp"
-                            android:layout_marginTop="12dp"
-                            android:text="Grant Overlay Permission"
-                            android:visibility="gone"
-                            app:cornerRadius="24dp" />
-
                     </LinearLayout>
                 </com.google.android.material.card.MaterialCardView>
 
-                <!-- Minimalist Gesture Guide Card -->
+                <!-- Structured Multi-Touch Gesture Reference Card -->
                 <com.google.android.material.card.MaterialCardView
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:layout_marginTop="16dp"
+                    android:layout_marginTop="14dp"
                     app:cardBackgroundColor="?attr/colorSurfaceVariant"
                     app:cardCornerRadius="24dp"
                     app:cardElevation="0dp"
@@ -297,23 +440,221 @@
                         <TextView
                             android:layout_width="wrap_content"
                             android:layout_height="wrap_content"
-                            android:text="v1.2 Trackpad Gestures"
+                            android:letterSpacing="0.06"
+                            android:text="MULTI-TOUCH GESTURES"
                             android:textColor="?attr/colorPrimary"
-                            android:textSize="13sp"
+                            android:textSize="11sp"
                             android:textStyle="bold" />
 
-                        <TextView
-                            android:layout_width="wrap_content"
+                        <!-- Gesture 1 -->
+                        <LinearLayout
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:layout_marginTop="14dp"
+                            android:gravity="center_vertical"
+                            android:orientation="horizontal">
+
+                            <TextView
+                                android:layout_width="46dp"
+                                android:layout_height="32dp"
+                                android:background="@drawable/bg_icon_badge"
+                                android:gravity="center"
+                                android:text="1F"
+                                android:textColor="?attr/colorPrimary"
+                                android:textSize="12sp"
+                                android:textStyle="bold" />
+
+                            <LinearLayout
+                                android:layout_width="0dp"
+                                android:layout_height="wrap_content"
+                                android:layout_marginStart="12dp"
+                                android:layout_weight="1"
+                                android:orientation="vertical">
+
+                                <TextView
+                                    android:layout_width="wrap_content"
+                                    android:layout_height="wrap_content"
+                                    android:text="1-Finger Glide &amp; Tap"
+                                    android:textColor="?attr/colorOnSurface"
+                                    android:textSize="14sp"
+                                    android:textStyle="bold" />
+
+                                <TextView
+                                    android:layout_width="wrap_content"
+                                    android:layout_height="wrap_content"
+                                    android:text="Sub-pixel cursor movement with velocity acceleration; tap to Left Click"
+                                    android:textColor="?attr/colorOnSurfaceVariant"
+                                    android:textSize="12sp" />
+                            </LinearLayout>
+                        </LinearLayout>
+
+                        <!-- Gesture 2 -->
+                        <LinearLayout
+                            android:layout_width="match_parent"
                             android:layout_height="wrap_content"
                             android:layout_marginTop="12dp"
-                            android:text="• 1-Finger Glide &amp; Tap — Move native cursor &amp; Left Click
-• 1-Finger Hold + 2nd-Finger Drag — Hold 1 finger stationary &amp; drag with 2nd finger to select/drag
-• 2-Finger Tap &amp; Glide — Right Click &amp; Smooth Wheel Scroll
-• 3-Finger Tap — Swap between Trackpad and Touch mode anytime
-• Auto-Keyboard — Switches to Touch when keyboard opens, and restores Trackpad when done"
-                            android:textColor="?attr/colorOnSurfaceVariant"
-                            android:textSize="13sp"
-                            android:lineSpacingExtra="6dp" />
+                            android:gravity="center_vertical"
+                            android:orientation="horizontal">
+
+                            <TextView
+                                android:layout_width="46dp"
+                                android:layout_height="32dp"
+                                android:background="@drawable/bg_icon_badge"
+                                android:gravity="center"
+                                android:text="HOLD"
+                                android:textColor="?attr/colorPrimary"
+                                android:textSize="10sp"
+                                android:textStyle="bold" />
+
+                            <LinearLayout
+                                android:layout_width="0dp"
+                                android:layout_height="wrap_content"
+                                android:layout_marginStart="12dp"
+                                android:layout_weight="1"
+                                android:orientation="vertical">
+
+                                <TextView
+                                    android:layout_width="wrap_content"
+                                    android:layout_height="wrap_content"
+                                    android:text="1-Finger Hold + 2nd-Finger Drag"
+                                    android:textColor="?attr/colorOnSurface"
+                                    android:textSize="14sp"
+                                    android:textStyle="bold" />
+
+                                <TextView
+                                    android:layout_width="wrap_content"
+                                    android:layout_height="wrap_content"
+                                    android:text="Park one finger stationary to lock Left Click down, slide second finger to drag"
+                                    android:textColor="?attr/colorOnSurfaceVariant"
+                                    android:textSize="12sp" />
+                            </LinearLayout>
+                        </LinearLayout>
+
+                        <!-- Gesture 3 -->
+                        <LinearLayout
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:layout_marginTop="12dp"
+                            android:gravity="center_vertical"
+                            android:orientation="horizontal">
+
+                            <TextView
+                                android:layout_width="46dp"
+                                android:layout_height="32dp"
+                                android:background="@drawable/bg_icon_badge"
+                                android:gravity="center"
+                                android:text="2F"
+                                android:textColor="?attr/colorPrimary"
+                                android:textSize="12sp"
+                                android:textStyle="bold" />
+
+                            <LinearLayout
+                                android:layout_width="0dp"
+                                android:layout_height="wrap_content"
+                                android:layout_marginStart="12dp"
+                                android:layout_weight="1"
+                                android:orientation="vertical">
+
+                                <TextView
+                                    android:layout_width="wrap_content"
+                                    android:layout_height="wrap_content"
+                                    android:text="2-Finger Tap &amp; Hi-Res Scroll"
+                                    android:textColor="?attr/colorOnSurface"
+                                    android:textSize="14sp"
+                                    android:textStyle="bold" />
+
+                                <TextView
+                                    android:layout_width="wrap_content"
+                                    android:layout_height="wrap_content"
+                                    android:text="Tap 2 fingers for Right Click; slide 2 fingers together for 2D wheel scrolling"
+                                    android:textColor="?attr/colorOnSurfaceVariant"
+                                    android:textSize="12sp" />
+                            </LinearLayout>
+                        </LinearLayout>
+
+                        <!-- Gesture 4 -->
+                        <LinearLayout
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:layout_marginTop="12dp"
+                            android:gravity="center_vertical"
+                            android:orientation="horizontal">
+
+                            <TextView
+                                android:layout_width="46dp"
+                                android:layout_height="32dp"
+                                android:background="@drawable/bg_icon_badge"
+                                android:gravity="center"
+                                android:text="3F"
+                                android:textColor="?attr/colorPrimary"
+                                android:textSize="12sp"
+                                android:textStyle="bold" />
+
+                            <LinearLayout
+                                android:layout_width="0dp"
+                                android:layout_height="wrap_content"
+                                android:layout_marginStart="12dp"
+                                android:layout_weight="1"
+                                android:orientation="vertical">
+
+                                <TextView
+                                    android:layout_width="wrap_content"
+                                    android:layout_height="wrap_content"
+                                    android:text="3-Finger Tap Mode Swap"
+                                    android:textColor="?attr/colorOnSurface"
+                                    android:textSize="14sp"
+                                    android:textStyle="bold" />
+
+                                <TextView
+                                    android:layout_width="wrap_content"
+                                    android:layout_height="wrap_content"
+                                    android:text="Tap with 3 fingers anywhere to toggle between Trackpad and Direct Touch"
+                                    android:textColor="?attr/colorOnSurfaceVariant"
+                                    android:textSize="12sp" />
+                            </LinearLayout>
+                        </LinearLayout>
+
+                        <!-- Gesture 5 -->
+                        <LinearLayout
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:layout_marginTop="12dp"
+                            android:gravity="center_vertical"
+                            android:orientation="horizontal">
+
+                            <TextView
+                                android:layout_width="46dp"
+                                android:layout_height="32dp"
+                                android:background="@drawable/bg_icon_badge"
+                                android:gravity="center"
+                                android:text="IME"
+                                android:textColor="?attr/colorPrimary"
+                                android:textSize="11sp"
+                                android:textStyle="bold" />
+
+                            <LinearLayout
+                                android:layout_width="0dp"
+                                android:layout_height="wrap_content"
+                                android:layout_marginStart="12dp"
+                                android:layout_weight="1"
+                                android:orientation="vertical">
+
+                                <TextView
+                                    android:layout_width="wrap_content"
+                                    android:layout_height="wrap_content"
+                                    android:text="Smart Keyboard Auto-Touch"
+                                    android:textColor="?attr/colorOnSurface"
+                                    android:textSize="14sp"
+                                    android:textStyle="bold" />
+
+                                <TextView
+                                    android:layout_width="wrap_content"
+                                    android:layout_height="wrap_content"
+                                    android:text="Automatically pauses trackpad capture while typing and resumes when keyboard closes"
+                                    android:textColor="?attr/colorOnSurfaceVariant"
+                                    android:textSize="12sp" />
+                            </LinearLayout>
+                        </LinearLayout>
 
                     </LinearLayout>
                 </com.google.android.material.card.MaterialCardView>
@@ -321,7 +662,7 @@
             </LinearLayout>
 
             <!-- ============================================================
-                 TAB 2: DEDICATED PIXEL SETTINGS PAGE
+                 TAB 2: SETTINGS & CALIBRATION PAGE
                  ============================================================ -->
             <LinearLayout
                 android:id="@+id/page_settings"
@@ -348,9 +689,10 @@
                         <TextView
                             android:layout_width="wrap_content"
                             android:layout_height="wrap_content"
-                            android:text="Speed &amp; Calibration"
+                            android:letterSpacing="0.06"
+                            android:text="SPEED &amp; CALIBRATION"
                             android:textColor="?attr/colorPrimary"
-                            android:textSize="13sp"
+                            android:textSize="11sp"
                             android:textStyle="bold" />
 
                         <LinearLayout
@@ -488,11 +830,11 @@
                     </LinearLayout>
                 </com.google.android.material.card.MaterialCardView>
 
-                <!-- Smart Behavior & Overlay Settings Card -->
+                <!-- Automation & Overlays Card -->
                 <com.google.android.material.card.MaterialCardView
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:layout_marginTop="16dp"
+                    android:layout_marginTop="14dp"
                     app:cardBackgroundColor="?attr/colorSurfaceVariant"
                     app:cardCornerRadius="24dp"
                     app:cardElevation="0dp"
@@ -507,9 +849,10 @@
                         <TextView
                             android:layout_width="wrap_content"
                             android:layout_height="wrap_content"
-                            android:text="Automation &amp; Overlays"
+                            android:letterSpacing="0.06"
+                            android:text="AUTOMATION &amp; BEHAVIOR"
                             android:textColor="?attr/colorPrimary"
-                            android:textSize="13sp"
+                            android:textSize="11sp"
                             android:textStyle="bold" />
 
                         <!-- Setting 1: Auto Keyboard Switch -->
@@ -566,7 +909,7 @@
                                 <TextView
                                     android:layout_width="wrap_content"
                                     android:layout_height="wrap_content"
-                                    android:text="Show Floating Mouse Buttons"
+                                    android:text="Show Floating Mouse Dock"
                                     android:textColor="?attr/colorOnSurface"
                                     android:textSize="15sp"
                                     android:textStyle="bold" />
@@ -574,7 +917,7 @@
                                 <TextView
                                     android:layout_width="wrap_content"
                                     android:layout_height="wrap_content"
-                                    android:text="Display L, MODE, R, and Hide buttons dock"
+                                    android:text="Display L, MODE, R, and Hide buttons pill"
                                     android:textColor="?attr/colorOnSurfaceVariant"
                                     android:textSize="12sp" />
                             </LinearLayout>
@@ -648,7 +991,7 @@
                                 <TextView
                                     android:layout_width="wrap_content"
                                     android:layout_height="wrap_content"
-                                    android:text="Tactile vibration on clicks and mode changes"
+                                    android:text="Tactile vibration on clicks and mode transitions"
                                     android:textColor="?attr/colorOnSurfaceVariant"
                                     android:textSize="12sp" />
                             </LinearLayout>
@@ -660,6 +1003,99 @@
                                 android:checked="true" />
                         </LinearLayout>
 
+                        <!-- Setting 5: Start on Boot -->
+                        <LinearLayout
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:layout_marginTop="16dp"
+                            android:gravity="center_vertical"
+                            android:orientation="horizontal">
+
+                            <LinearLayout
+                                android:layout_width="0dp"
+                                android:layout_height="wrap_content"
+                                android:layout_weight="1"
+                                android:orientation="vertical">
+
+                                <TextView
+                                    android:layout_width="wrap_content"
+                                    android:layout_height="wrap_content"
+                                    android:text="Start on Boot"
+                                    android:textColor="?attr/colorOnSurface"
+                                    android:textSize="15sp"
+                                    android:textStyle="bold" />
+
+                                <TextView
+                                    android:layout_width="wrap_content"
+                                    android:layout_height="wrap_content"
+                                    android:text="Automatically launch Arrowroot service when Android finishes booting"
+                                    android:textColor="?attr/colorOnSurfaceVariant"
+                                    android:textSize="12sp" />
+                            </LinearLayout>
+
+                            <com.google.android.material.materialswitch.MaterialSwitch
+                                android:id="@+id/switch_start_on_boot"
+                                android:layout_width="wrap_content"
+                                android:layout_height="wrap_content"
+                                android:checked="false" />
+                        </LinearLayout>
+
+                    </LinearLayout>
+                </com.google.android.material.card.MaterialCardView>
+
+                <!-- Architecture & Maintenance Card -->
+                <com.google.android.material.card.MaterialCardView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="14dp"
+                    app:cardBackgroundColor="?attr/colorSurfaceVariant"
+                    app:cardCornerRadius="24dp"
+                    app:cardElevation="0dp"
+                    app:strokeWidth="0dp">
+
+                    <LinearLayout
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:orientation="vertical"
+                        android:padding="20dp">
+
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:letterSpacing="0.06"
+                            android:text="ENGINE ARCHITECTURE"
+                            android:textColor="?attr/colorPrimary"
+                            android:textSize="11sp"
+                            android:textStyle="bold" />
+
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:layout_marginTop="8dp"
+                            android:text="Arrowroot v1.3.0 • Session-Authenticated Kernel Bridge"
+                            android:textColor="?attr/colorOnSurface"
+                            android:textSize="14sp"
+                            android:textStyle="bold" />
+
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:layout_marginTop="4dp"
+                            android:text="Uses root-only /dev/uinput hardware cursor registration, EVIOCGRAB direct multi-touch slot interception, and per-session 32-bit cryptographic IPC tokens."
+                            android:textColor="?attr/colorOnSurfaceVariant"
+                            android:textSize="12sp" />
+
+                        <com.google.android.material.button.MaterialButton
+                            android:id="@+id/btn_reset_defaults"
+                            style="@style/Widget.Material3.Button.TonalButton"
+                            android:layout_width="match_parent"
+                            android:layout_height="46dp"
+                            android:layout_marginTop="14dp"
+                            android:text="Reset All Settings to Default"
+                            app:cornerRadius="23dp"
+                            app:icon="@drawable/ic_reset"
+                            app:iconGravity="textStart" />
+
                     </LinearLayout>
                 </com.google.android.material.card.MaterialCardView>
 
@@ -668,13 +1104,13 @@
         </FrameLayout>
     </androidx.core.widget.NestedScrollView>
 
-    <!-- Google Play Store / Pixel Material You Bottom Navigation Bar -->
+    <!-- Bottom Navigation Bar -->
     <com.google.android.material.bottomnavigation.BottomNavigationView
         android:id="@+id/bottom_nav"
         android:layout_width="match_parent"
         android:layout_height="80dp"
         android:layout_gravity="bottom"
-        app:menu="@menu/bottom_nav_menu"
-        app:labelVisibilityMode="labeled" />
+        app:labelVisibilityMode="labeled"
+        app:menu="@menu/bottom_nav_menu" />
 
 </androidx.coordinatorlayout.widget.CoordinatorLayout>

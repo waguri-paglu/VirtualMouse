@@ -1,17 +1,16 @@
 /*
- * Virtual Mouse v1.2.0 — Kernel EVIOCGRAB + Original /dev/uinput Engine
+ * Arrowroot v1.3.0 — Kernel EVIOCGRAB + /dev/uinput Hardware Pointer Engine
  *
  * Features:
- * 1. Genuine /dev/uinput hardware mouse (EV_REL + BTN_LEFT/BTN_RIGHT/BTN_MIDDLE)
- * 2. Kernel EVIOCGRAB touchscreen capture in Trackpad Mode
- * 3. Gesture: 1-Finger Hold + 2nd-Finger Drag:
- *    - Hold 1st finger on screen (>90ms, or stationary when 2nd finger touches down)
- *    - 1st finger immediately holds LMB down (BTN_LEFT = 1)
- *    - 2nd finger exclusively controls cursor movement (REL_X, REL_Y)
- *    - Supports multi-stroke dragging (lifting and re-placing 2nd finger while 1st finger stays held)
- *    - Releases BTN_LEFT = 0 when 1st finger lifts!
- * 4. Gesture: 2-Finger Scroll (only when both fingers touch down together <90ms apart and slide together)
- * 5. Gesture: Bi-directional 3-Finger Tap -> swaps Trackpad <-> Touch mode in both states!
+ * 1. Genuine /dev/uinput hardware mouse (EV_REL + BTN_LEFT/BTN_RIGHT/BTN_MIDDLE + HI_RES wheel)
+ * 2. Kernel EVIOCGRAB touchscreen capture in Trackpad Mode with clean MT slot flushing
+ * 3. Session-authenticated loopback IPC (per-session 32-bit token + thread-safe JNI bridge)
+ * 4. Async-signal-safe lifecycle management (clean EVIOCGRAB & UI_DEV_DESTROY teardown)
+ * 5. Multi-Touch Gestures:
+ *    - 1-Finger Glide & Tap (Left Click)
+ *    - Bi-Directional 1-Finger Hold + 2nd-Finger Drag (with multi-stroke support)
+ *    - 2-Finger Tap (Right Click) & 2-Finger Smooth Hi-Res Scroll
+ *    - Bi-Directional 3-Finger Tap (Trackpad <-> Touch Mode swap)
  */
 
 #include <stdio.h>
@@ -27,6 +26,7 @@
 #include <signal.h>
 #include <sched.h>
 #include <poll.h>
+#include <pthread.h>
 #include <jni.h>
 #include <sys/time.h>
 #include <sys/resource.h>
@@ -40,7 +40,7 @@
 
 #ifdef __ANDROID__
 #include <android/log.h>
-#define LOG_TAG "VMouseDaemon"
+#define LOG_TAG "ArrowrootDaemon"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 #else
@@ -48,7 +48,7 @@
 #define LOGE(...) do { fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); } while(0)
 #endif
 
-#define DAEMON_UDP_PORT 29876
+#define DAEMON_UDP_PORT   29876
 #define APP_CALLBACK_PORT 29877
 
 #define CMD_MOVE        1
@@ -69,6 +69,7 @@
 #define CB_HIDE_OVERLAY  2
 
 struct vmouse_packet {
+    int32_t token;
     int32_t cmd;
     int32_t arg1;
     int32_t arg2;
@@ -77,12 +78,14 @@ struct vmouse_packet {
 };
 
 /* ============================================================================
- * PART 1: JNI Client Bridge
+ * PART 1: Thread-Safe JNI Client Bridge
  * ============================================================================ */
 static int client_sock = -1;
 static struct sockaddr_in daemon_addr;
+static int32_t client_auth_token = 0;
+static pthread_mutex_t client_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-static void ensure_client_socket(void) {
+static void ensure_client_socket_locked(void) {
     if (client_sock >= 0) return;
 
     client_sock = socket(AF_INET, SOCK_DGRAM, 0);
@@ -91,10 +94,28 @@ static void ensure_client_socket(void) {
     int sndbuf = 262144;
     setsockopt(client_sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
 
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = 50000;
+    setsockopt(client_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
     memset(&daemon_addr, 0, sizeof(daemon_addr));
     daemon_addr.sin_family = AF_INET;
     daemon_addr.sin_port = htons(DAEMON_UDP_PORT);
     daemon_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+}
+
+JNIEXPORT void JNICALL
+Java_com_virtualmouse_app_RootMouseController_nativeSetAuthToken(
+    JNIEnv *env,
+    jclass clazz,
+    jint token
+) {
+    (void)env;
+    (void)clazz;
+    pthread_mutex_lock(&client_mutex);
+    client_auth_token = (int32_t)token;
+    pthread_mutex_unlock(&client_mutex);
 }
 
 JNIEXPORT jboolean JNICALL
@@ -110,15 +131,26 @@ Java_com_virtualmouse_app_RootMouseController_nativeSendPacket(
     (void)env;
     (void)clazz;
 
-    ensure_client_socket();
-    if (client_sock < 0) return JNI_FALSE;
+    pthread_mutex_lock(&client_mutex);
+    ensure_client_socket_locked();
+    if (client_sock < 0) {
+        pthread_mutex_unlock(&client_mutex);
+        return JNI_FALSE;
+    }
 
     struct vmouse_packet pkt;
+    pkt.token = client_auth_token;
     pkt.cmd = (int32_t)cmd;
     pkt.arg1 = (int32_t)arg1;
     pkt.arg2 = (int32_t)arg2;
     pkt.arg3 = (int32_t)arg3;
     pkt.arg4 = (int32_t)arg4;
+
+    if (cmd == CMD_PING) {
+        /* Drain any stale pong packets before pinging */
+        int32_t stale = 0;
+        while (recv(client_sock, &stale, sizeof(stale), MSG_DONTWAIT) > 0) {}
+    }
 
     ssize_t sent = sendto(
         client_sock,
@@ -130,15 +162,13 @@ Java_com_virtualmouse_app_RootMouseController_nativeSendPacket(
     );
 
     if (cmd == CMD_PING && sent == sizeof(pkt)) {
-        struct timeval tv;
-        tv.tv_sec = 0;
-        tv.tv_usec = 50000;
-        setsockopt(client_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         int32_t pong = 0;
         ssize_t r = recv(client_sock, &pong, sizeof(pong), 0);
+        pthread_mutex_unlock(&client_mutex);
         return (r == sizeof(pong) && pong == 1) ? JNI_TRUE : JNI_FALSE;
     }
 
+    pthread_mutex_unlock(&client_mutex);
     return (sent == sizeof(pkt)) ? JNI_TRUE : JNI_FALSE;
 }
 
@@ -148,7 +178,8 @@ Java_com_virtualmouse_app_RootMouseController_nativeSendPacket(
 static int uinput_fd = -1;
 static int touch_fd = -1;
 static int sock_fd = -1;
-static volatile int keep_running = 1;
+static int32_t daemon_auth_token = 0;
+static volatile sig_atomic_t keep_running = 1;
 static int is_grabbed = 0;
 
 static int touch_min_x = 0, touch_max_x = 1080;
@@ -166,13 +197,14 @@ static int dock_top = 0;
 static int dock_right = 0;
 static int dock_bottom = 0;
 
-#define MAX_SLOTS 10
+#define MAX_SLOTS     10
 #define ROLE_NONE     0
 #define ROLE_TRACKPAD 1
 #define ROLE_BTN_L    2
 #define ROLE_BTN_MODE 3
 #define ROLE_BTN_R    4
 #define ROLE_BTN_HIDE 5
+#define ROLE_GRIP     6
 
 struct touch_slot {
     int active;
@@ -185,7 +217,7 @@ struct touch_slot {
     int prev_y;
     int down_x;
     int down_y;
-    int anchor_x; /* Position of 1st finger at the moment 2nd finger touched down */
+    int anchor_x;
     int anchor_y;
     int64_t down_time_ms;
     int role;
@@ -235,6 +267,7 @@ static void notify_app_event(int32_t event_code) {
 }
 
 static inline void emit_single_with_syn(int fd, int type, int code, int val) {
+    if (fd < 0) return;
     struct input_event ev[2];
     memset(ev, 0, sizeof(ev));
     ev[0].type = type;
@@ -247,8 +280,8 @@ static inline void emit_single_with_syn(int fd, int type, int code, int val) {
 }
 
 static inline void emit_wheel_scroll(int fd, int sy, int sx) {
-    if (sy == 0 && sx == 0) return;
-    struct input_event ev[5];
+    if (fd < 0 || (sy == 0 && sx == 0)) return;
+    struct input_event ev[6];
     int n = 0;
     memset(ev, 0, sizeof(ev));
     if (sy != 0) {
@@ -283,7 +316,7 @@ static inline void emit_wheel_scroll(int fd, int sy, int sx) {
 }
 
 static inline void emit_move_batched(int fd, int dx, int dy) {
-    if (dx == 0 && dy == 0) return;
+    if (fd < 0 || (dx == 0 && dy == 0)) return;
     struct input_event ev[3];
     int count = 0;
     memset(ev, 0, sizeof(ev));
@@ -329,12 +362,12 @@ static int has_active_fingers(void) {
 
 /*
  * Injects a complete multi-touch slot release sweep (Slots 0..9 -> ABS_MT_TRACKING_ID = -1,
- * ABS_MT_SLOT = 0, BTN_TOUCH = 0, SYN_REPORT) into touch_fd while ungrabbed so Android's
- * InputReader never retains a stuck ghost finger across EVIOCGRAB transitions.
+ * ABS_MT_SLOT = 0, BTN_TOUCH = 0, BTN_TOOL_FINGER = 0, SYN_REPORT) into touch_fd while ungrabbed
+ * so Android's InputReader never retains a stuck ghost finger across EVIOCGRAB transitions.
  */
 static void flush_android_touch_slots(void) {
     if (touch_fd < 0) return;
-    struct input_event ev[24];
+    struct input_event ev[32];
     int n = 0;
     memset(ev, 0, sizeof(ev));
 
@@ -400,7 +433,6 @@ static void apply_touch_grab_now(int enable) {
     deferred_grab_deadline_ms = 0;
 
     if (enable && !is_grabbed) {
-        /* Cleanly release all slots to Android InputReader BEFORE grabbing */
         flush_android_touch_slots();
         if (ioctl(touch_fd, EVIOCGRAB, 1) == 0) {
             is_grabbed = 1;
@@ -422,7 +454,6 @@ static void apply_touch_grab_now(int enable) {
     } else if (!enable && is_grabbed) {
         ioctl(touch_fd, EVIOCGRAB, 0);
         is_grabbed = 0;
-        /* Cleanly reset all slots & current_slot=0 to Android InputReader AFTER ungrabbing */
         flush_android_touch_slots();
         memset(slots, 0, sizeof(slots));
         sync_slot_state_from_kernel();
@@ -449,7 +480,6 @@ static void set_touch_grab(int enable) {
     if (!has_active_fingers()) {
         apply_touch_grab_now(enable);
     } else {
-        /* Wait until fingers lift off the glass so no slot is cut off mid-touch */
         deferred_grab_target = enable ? 1 : 0;
         deferred_grab_deadline_ms = now_ms() + 300;
     }
@@ -470,18 +500,19 @@ void cleanup_device(void) {
         sock_fd = -1;
     }
     if (uinput_fd >= 0) {
-        LOGI("Destroying virtual mouse device");
+        emit_single_with_syn(uinput_fd, EV_KEY, BTN_LEFT, 0);
+        emit_single_with_syn(uinput_fd, EV_KEY, BTN_RIGHT, 0);
+        LOGI("Destroying Arrowroot virtual mouse device");
         ioctl(uinput_fd, UI_DEV_DESTROY);
         close(uinput_fd);
         uinput_fd = -1;
     }
 }
 
+/* Async-signal-safe handler: only flips sig_atomic_t flag so main loop cleans up safely */
 void signal_handler(int sig) {
     (void)sig;
     keep_running = 0;
-    cleanup_device();
-    exit(0);
 }
 
 #define TEST_BIT(bit, array) ((array[(bit) / 8] & (1 << ((bit) % 8))) != 0)
@@ -491,19 +522,21 @@ static int open_touchscreen_device(void) {
     char name[128];
     uint8_t ev_bits[(EV_MAX + 1) / 8];
     uint8_t abs_bits[(ABS_MAX + 1) / 8];
+    uint8_t prop_bits[(INPUT_PROP_MAX + 1) / 8];
+
+    int fallback_fd = -1;
+    int fb_min_x = 0, fb_max_x = 1080, fb_min_y = 0, fb_max_y = 2400;
 
     for (int i = 0; i < 32; i++) {
         snprintf(path, sizeof(path), "/dev/input/event%d", i);
         int fd = open(path, O_RDWR | O_NONBLOCK);
-        if (fd < 0) {
-            fd = open(path, O_RDONLY | O_NONBLOCK);
-        }
         if (fd < 0) continue;
 
         memset(name, 0, sizeof(name));
         ioctl(fd, EVIOCGNAME(sizeof(name) - 1), name);
 
-        if (strstr(name, "Virtual Mobile Trackpad") != NULL ||
+        if (strstr(name, "Arrowroot") != NULL ||
+            strstr(name, "Virtual Mobile Trackpad") != NULL ||
             strstr(name, "uinput") != NULL) {
             close(fd);
             continue;
@@ -511,6 +544,8 @@ static int open_touchscreen_device(void) {
 
         memset(ev_bits, 0, sizeof(ev_bits));
         memset(abs_bits, 0, sizeof(abs_bits));
+        memset(prop_bits, 0, sizeof(prop_bits));
+
         if (ioctl(fd, EVIOCGBIT(0, sizeof(ev_bits)), ev_bits) < 0 ||
             !TEST_BIT(EV_ABS, ev_bits)) {
             close(fd);
@@ -526,19 +561,47 @@ static int open_touchscreen_device(void) {
             struct input_absinfo abs_x, abs_y;
             memset(&abs_x, 0, sizeof(abs_x));
             memset(&abs_y, 0, sizeof(abs_y));
+            int min_x = 0, max_x = 1080, min_y = 0, max_y = 2400;
             if (ioctl(fd, EVIOCGABS(ABS_MT_POSITION_X), &abs_x) == 0 &&
                 ioctl(fd, EVIOCGABS(ABS_MT_POSITION_Y), &abs_y) == 0) {
-                touch_min_x = abs_x.minimum;
-                touch_max_x = (abs_x.maximum > abs_x.minimum) ? abs_x.maximum : 1080;
-                touch_min_y = abs_y.minimum;
-                touch_max_y = (abs_y.maximum > abs_y.minimum) ? abs_y.maximum : 2400;
+                min_x = abs_x.minimum;
+                max_x = (abs_x.maximum > abs_x.minimum) ? abs_x.maximum : 1080;
+                min_y = abs_y.minimum;
+                max_y = (abs_y.maximum > abs_y.minimum) ? abs_y.maximum : 2400;
             }
-            LOGI("Found physical touchscreen: %s (%s) X=[%d..%d] Y=[%d..%d]",
-                 path, name, touch_min_x, touch_max_x, touch_min_y, touch_max_y);
-            return fd;
-        }
 
-        close(fd);
+            ioctl(fd, EVIOCGPROP(sizeof(prop_bits)), prop_bits);
+            if (TEST_BIT(INPUT_PROP_DIRECT, prop_bits)) {
+                if (fallback_fd >= 0) close(fallback_fd);
+                touch_min_x = min_x;
+                touch_max_x = max_x;
+                touch_min_y = min_y;
+                touch_max_y = max_y;
+                LOGI("Found direct physical touchscreen: %s (%s) X=[%d..%d] Y=[%d..%d]",
+                     path, name, touch_min_x, touch_max_x, touch_min_y, touch_max_y);
+                return fd;
+            }
+
+            if (fallback_fd < 0) {
+                fallback_fd = fd;
+                fb_min_x = min_x;
+                fb_max_x = max_x;
+                fb_min_y = min_y;
+                fb_max_y = max_y;
+            } else {
+                close(fd);
+            }
+        } else {
+            close(fd);
+        }
+    }
+
+    if (fallback_fd >= 0) {
+        touch_min_x = fb_min_x;
+        touch_max_x = fb_max_x;
+        touch_min_y = fb_min_y;
+        touch_max_y = fb_max_y;
+        return fallback_fd;
     }
     return -1;
 }
@@ -576,11 +639,11 @@ static int init_uinput(void) {
 
     struct uinput_user_dev uidev;
     memset(&uidev, 0, sizeof(uidev));
-    snprintf(uidev.name, UINPUT_MAX_NAME_SIZE, "Virtual Mobile Trackpad Mouse");
+    snprintf(uidev.name, UINPUT_MAX_NAME_SIZE, "Arrowroot Hardware Pointer");
     uidev.id.bustype = BUS_USB;
     uidev.id.vendor = 0x1234;
     uidev.id.product = 0x5678;
-    uidev.id.version = 1;
+    uidev.id.version = 2;
 
     if (write(fd, &uidev, sizeof(uidev)) < 0) {
         close(fd);
@@ -653,16 +716,26 @@ static void map_raw_to_screen(int raw_x, int raw_y, int *out_x, int *out_y) {
     }
 }
 
+/*
+ * Matches exact proportional button geometry in layout_overlay_controls.xml:
+ *   0..10%  -> Drag grip handle (ROLE_GRIP)
+ *  10..33%  -> Left click button (ROLE_BTN_L)
+ *  33..62%  -> Mode toggle pill (ROLE_BTN_MODE)
+ *  62..84%  -> Right click button (ROLE_BTN_R)
+ *  84..100% -> Hide dock button (ROLE_BTN_HIDE)
+ */
 static int classify_dock_zone(int sx, int sy) {
     if (dock_right > dock_left && dock_bottom > dock_top) {
         if (sx >= dock_left && sx <= dock_right && sy >= dock_top && sy <= dock_bottom) {
             int width = dock_right - dock_left;
             int rel_x = sx - dock_left;
-            if (rel_x < (width * 28) / 100) {
+            if (rel_x < (width * 10) / 100) {
+                return ROLE_GRIP;
+            } else if (rel_x < (width * 33) / 100) {
                 return ROLE_BTN_L;
-            } else if (rel_x < (width * 56) / 100) {
+            } else if (rel_x < (width * 62) / 100) {
                 return ROLE_BTN_MODE;
-            } else if (rel_x < (width * 82) / 100) {
+            } else if (rel_x < (width * 84) / 100) {
                 return ROLE_BTN_R;
             } else {
                 return ROLE_BTN_HIDE;
@@ -760,7 +833,7 @@ static void process_touch_frame_syn(void) {
         }
     }
 
-    /* In Normal Touch mode (is_grabbed == 0), watch for 3-Finger Tap to switch back to Trackpad! */
+    /* In Normal Touch mode (is_grabbed == 0), watch for 3-Finger Tap to switch back to Trackpad */
     if (!is_grabbed) {
         for (int i = 0; i < MAX_SLOTS; i++) {
             if (slots[i].just_up) {
@@ -796,20 +869,11 @@ static void process_touch_frame_syn(void) {
         struct touch_slot *s0 = &slots[idx0];
         struct touch_slot *s1 = &slots[idx1];
 
-        /* Identify earlier (1st) finger and later (2nd) finger */
         int first_idx = (s0->down_time_ms <= s1->down_time_ms) ? idx0 : idx1;
         int second_idx = (s0->down_time_ms <= s1->down_time_ms) ? idx1 : idx0;
         struct touch_slot *first_f = &slots[first_idx];
         struct touch_slot *second_f = &slots[second_idx];
 
-        /*
-         * 2-Finger Scroll vs. Bi-Directional Hold + Drag Classifier:
-         * - 2-Finger Scroll: Both fingers move (> 12px each). Also if Hold+Drag started
-         *   tentatively because one finger slipped first, and the "stationary" finger also
-         *   moves > 26px within 250ms, it automatically upgrades into 2-Finger Scroll!
-         * - Bi-Directional Hold + Drag: One finger stays genuinely parked in place (<= 15px)
-         *   for >= 65ms while the other finger drags >= 48px!
-         */
         if (new_trackpad_finger_down) {
             s0->anchor_x = s0->screen_x;
             s0->anchor_y = s0->screen_y;
@@ -820,7 +884,6 @@ static void process_touch_frame_syn(void) {
             two_finger_start_ms = now;
 
             if (hold_and_drag_mode) {
-                /* Multi-stroke continuation: the finger that remained on screen is the hold anchor */
                 hold_anchor_slot = first_idx;
                 first_f->moved_beyond_tap = 1;
                 second_f->moved_beyond_tap = 1;
@@ -835,7 +898,6 @@ static void process_touch_frame_syn(void) {
 
         if (!hold_and_drag_mode && !two_finger_scroll_mode) {
             if (d0_anchor_sq > (12 * 12) && d1_anchor_sq > (12 * 12)) {
-                /* Both fingers moved past 12px -> 2-Finger Scroll! */
                 two_finger_scroll_mode = 1;
                 last_mid_x = (s0->anchor_x + s1->anchor_x) / 2;
                 last_mid_y = (s0->anchor_y + s1->anchor_y) / 2;
@@ -845,7 +907,6 @@ static void process_touch_frame_syn(void) {
                 s1->moved_beyond_tap = 1;
             } else if (two_finger_elapsed >= 65 &&
                        d0_anchor_sq <= (15 * 15) && d1_anchor_sq > (48 * 48)) {
-                /* Finger s0 is held stationary (<=15px for >=65ms) and Finger s1 dragged >48px */
                 hold_and_drag_mode = 1;
                 hold_anchor_slot = idx0;
                 s0->moved_beyond_tap = 1;
@@ -853,7 +914,6 @@ static void process_touch_frame_syn(void) {
                 emit_single_with_syn(uinput_fd, EV_KEY, BTN_LEFT, 1);
             } else if (two_finger_elapsed >= 65 &&
                        d1_anchor_sq <= (15 * 15) && d0_anchor_sq > (48 * 48)) {
-                /* Finger s1 is held stationary (<=15px for >=65ms) and Finger s0 dragged >48px */
                 hold_and_drag_mode = 1;
                 hold_anchor_slot = idx1;
                 s0->moved_beyond_tap = 1;
@@ -861,10 +921,6 @@ static void process_touch_frame_syn(void) {
                 emit_single_with_syn(uinput_fd, EV_KEY, BTN_LEFT, 1);
             }
         } else if (hold_and_drag_mode && two_finger_elapsed < 260) {
-            /*
-             * Safety recovery: if the "stationary" anchor finger ALSO slides > 28px within 260ms,
-             * the user is actually sliding both fingers to 2-finger scroll!
-             */
             int anchor_drift_sq = (hold_anchor_slot == idx0) ? d0_anchor_sq : d1_anchor_sq;
             if (anchor_drift_sq > (28 * 28)) {
                 hold_and_drag_mode = 0;
@@ -911,7 +967,7 @@ static void process_touch_frame_syn(void) {
             s1->prev_x = s1->screen_x;
             s1->prev_y = s1->screen_y;
         }
-    } else if (active_trackpad_count == 1 && gesture_max_fingers < 3 && !two_finger_scroll_mode) {
+    } else if (active_trackpad_count == 1 && !two_finger_scroll_mode) {
         int idx = active_trackpad_slots[0];
         struct touch_slot *s = &slots[idx];
         int raw_dx = s->screen_x - s->prev_x;
@@ -920,11 +976,10 @@ static void process_touch_frame_syn(void) {
         s->prev_y = s->screen_y;
 
         if (hold_and_drag_mode) {
-            /* If 1st anchor finger is held alone (2nd finger lifted for multi-stroke), keep BTN_LEFT held! */
             if (idx != hold_anchor_slot) {
                 emit_scaled_move(raw_dx, raw_dy);
             }
-        } else {
+        } else if (gesture_max_fingers == 1) {
             int dist_from_down_sq = dist_sq(s->screen_x, s->screen_y, s->down_x, s->down_y);
             if (dist_from_down_sq > (24 * 24)) {
                 s->moved_beyond_tap = 1;
@@ -947,7 +1002,6 @@ static void process_touch_frame_syn(void) {
                 emit_single_with_syn(uinput_fd, EV_KEY, BTN_RIGHT, 0);
             } else if (s->role == ROLE_TRACKPAD) {
                 if (hold_and_drag_mode && (i == hold_anchor_slot || hold_anchor_slot == -1)) {
-                    /* Anchor (hold) finger lifted -> release BTN_LEFT and let remaining finger move normally! */
                     hold_and_drag_mode = 0;
                     hold_anchor_slot = -1;
                     emit_single_with_syn(uinput_fd, EV_KEY, BTN_LEFT, 0);
@@ -987,7 +1041,7 @@ static void process_touch_frame_syn(void) {
             emit_single_with_syn(uinput_fd, EV_KEY, BTN_RIGHT, 0);
         } else if (three_finger_tap_enabled && gesture_max_fingers == 3 &&
                    !gesture_moved_too_far && gesture_dur < 420) {
-            /* 3-Finger Tap -> Swap to Touch Mode! */
+            /* 3-Finger Tap -> Swap to Touch Mode */
             pending_mode_swap = 1;
         }
 
@@ -1052,6 +1106,14 @@ static void handle_udp_packet(
     const struct sockaddr_in *client_addr,
     socklen_t client_len
 ) {
+    if (client_addr == NULL || client_addr->sin_addr.s_addr != htonl(INADDR_LOOPBACK)) {
+        return;
+    }
+    if (daemon_auth_token != 0 && pkt->token != daemon_auth_token) {
+        LOGE("Rejected unauthorized UDP packet (invalid token)");
+        return;
+    }
+
     switch (pkt->cmd) {
         case CMD_MOVE:
             emit_move_batched(uinput_fd, pkt->arg1, pkt->arg2);
@@ -1070,10 +1132,10 @@ static void handle_udp_packet(
             break;
         }
         case CMD_SCROLL_V:
-            emit_single_with_syn(uinput_fd, EV_REL, REL_WHEEL, pkt->arg1);
+            emit_wheel_scroll(uinput_fd, pkt->arg1, 0);
             break;
         case CMD_SCROLL_H:
-            emit_single_with_syn(uinput_fd, EV_REL, REL_HWHEEL, pkt->arg1);
+            emit_wheel_scroll(uinput_fd, 0, pkt->arg1);
             break;
         case CMD_SET_GRAB:
             set_touch_grab(pkt->arg1);
@@ -1093,7 +1155,7 @@ static void handle_udp_packet(
             dock_bottom = pkt->arg4;
             break;
         case CMD_PING:
-            if (client_addr != NULL && client_len > 0) {
+            if (client_len > 0) {
                 int32_t pong = 1;
                 sendto(sock_fd, &pong, sizeof(pong), MSG_DONTWAIT,
                        (const struct sockaddr *)client_addr, client_len);
@@ -1108,12 +1170,23 @@ static void handle_udp_packet(
 }
 
 int main(int argc, char *argv[]) {
-    (void)argc;
-    (void)argv;
+    const char *env_tok = getenv("ARROWROOT_TOKEN");
+    if (env_tok != NULL && env_tok[0] != '\0') {
+        daemon_auth_token = (int32_t)strtol(env_tok, NULL, 10);
+    }
+    for (int i = 1; i < argc - 1; i++) {
+        if (strcmp(argv[i], "--token") == 0) {
+            daemon_auth_token = (int32_t)strtol(argv[i + 1], NULL, 10);
+        }
+    }
 
-    signal(SIGINT, signal_handler);
-    signal(SIGTERM, signal_handler);
-    signal(SIGHUP, signal_handler);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGHUP, &sa, NULL);
 
     setpriority(PRIO_PROCESS, 0, -20);
     struct sched_param sp;
@@ -1179,6 +1252,6 @@ int main(int argc, char *argv[]) {
     }
 
     cleanup_device();
-    LOGI("VMouse daemon terminated normally.");
+    LOGI("Arrowroot daemon terminated cleanly.");
     return 0;
 }
